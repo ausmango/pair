@@ -34,3 +34,4 @@ mkdir -p dist/jetson
 cp target/release/pair dist/jetson/pair
 cp JETSON.md dist/jetson/JETSON.md
 ldd dist/jetson/pair | tee dist/jetson/LINKED-LIBRARIES.txt
+chmod -R a+rwX dist
