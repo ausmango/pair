@@ -1,0 +1,48 @@
+name: Build Jetson release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  jetson-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in the JetPack 4 userspace generation
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            ubuntu:18.04 \
+            bash ci/build-jetson.sh
+
+      - name: Package
+        run: |
+          tar -C dist/jetson -czf dist/pair-linux-arm64-jetpack4.tar.gz pair JETSON.md LINKED-LIBRARIES.txt
+          cd dist
+          sha256sum pair-linux-arm64-jetpack4.tar.gz > pair-linux-arm64-jetpack4.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pair-linux-arm64-jetpack4
+          path: |
+            dist/pair-linux-arm64-jetpack4.tar.gz
+            dist/pair-linux-arm64-jetpack4.tar.gz.sha256
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/pair-linux-arm64-jetpack4.tar.gz \
+            dist/pair-linux-arm64-jetpack4.tar.gz.sha256 \
+            --title "pair $GITHUB_REF_NAME" \
+            --notes "Windows/Linux LAN notepad. The ARM64 archive is built in Ubuntu 18.04 for the original Jetson Nano / JetPack 4 userspace generation. Linux hardware validation is still pending."

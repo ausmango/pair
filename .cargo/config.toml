@@ -1,0 +1,9 @@
+# Keep the Windows artifact to one executable, plus Windows' own system DLLs.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
