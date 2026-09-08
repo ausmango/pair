@@ -5,19 +5,44 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::state::{Edit, Snapshot};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_NOTE_BYTES: usize = 256 * 1024;
 // JSON can escape each byte as six ASCII bytes (e.g. a control character).
 pub const MAX_FRAME_BYTES: usize = MAX_NOTE_BYTES * 6 + 4096;
 pub const MAX_HELLO_BYTES: usize = 512;
+pub const MAX_PAIRING_BYTES: usize = 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
-    Hello { version: u32, token: String },
+    Hello {
+        version: u32,
+        token: String,
+    },
     AuthFailed {},
-    State { snapshot: Snapshot },
-    Edit { edit: Edit },
+    VersionMismatch {
+        expected: u32,
+    },
+    PairRequest {
+        version: u32,
+        device_id: String,
+        device_name: String,
+    },
+    PairReady {
+        host_id: String,
+        host_name: String,
+    },
+    PairConfirm {},
+    PairGranted {
+        token: String,
+    },
+    PairRejected {},
+    State {
+        snapshot: Snapshot,
+    },
+    Edit {
+        edit: Edit,
+    },
     TakeControl {},
     Ping {},
     Pong {},
@@ -43,8 +68,26 @@ impl Message {
         match self {
             Self::State { snapshot } => validate_note(&snapshot.text).map_err(invalid),
             Self::Edit { edit } => validate_note(&edit.text).map_err(invalid),
-            Self::Hello { token, .. } if token.len() != 64 => {
+            Self::Hello { token, .. } | Self::PairGranted { token }
+                if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
                 Err(invalid("Invalid pairing token length."))
+            }
+            Self::PairRequest {
+                device_id,
+                device_name,
+                ..
+            }
+            | Self::PairReady {
+                host_id: device_id,
+                host_name: device_name,
+            } if device_id.len() != 32
+                || !device_id.bytes().all(|b| b.is_ascii_hexdigit())
+                || device_name.is_empty()
+                || device_name.len() > 32
+                || device_name.chars().any(|c| c.is_control()) =>
+            {
+                Err(invalid("Invalid pairing identity."))
             }
             _ => Ok(()),
         }

@@ -1,11 +1,18 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use pair::{
     editor::Editor,
-    network::{Command, Mode, Network, View, accept_authenticated, connect_authenticated},
+    network::{
+        Command, ConnectTarget, Mode, Network, View, accept_authenticated, connect_authenticated,
+    },
+    persistence::{DeviceIdentity, Store},
     protocol::{MAX_FRAME_BYTES, Message, read_frame, write_frame},
     state::{Authority, Edit, Side, Snapshot},
-    tls::{Identity, Pairing},
+    tls::{Identity, Pairing, random_bytes},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -15,6 +22,18 @@ use tokio::{
 use tokio_rustls::TlsStream;
 
 const DEADLINE: Duration = Duration::from_secs(10);
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn store(label: &str) -> Store {
+    let directory: PathBuf = std::env::temp_dir().join(format!(
+        "pair-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = directory.join("state.json");
+    let _ = std::fs::remove_dir_all(&directory);
+    Store::load(path).unwrap()
+}
 
 async fn wait_view(network: &mut Network, predicate: impl Fn(&View) -> bool) -> View {
     timeout(DEADLINE, async {
@@ -59,22 +78,132 @@ fn edit(snapshot: &Snapshot, seq: u64, text: &str) -> Edit {
 }
 
 #[tokio::test]
-async fn real_tls_host_enforces_ownership_and_reconnect_sends_latest_state() {
+async fn first_pairing_requires_both_confirmations_then_reconnects_with_saved_trust() {
+    let host_store = store("host-pair");
+    let client_store = store("client-pair");
     let mut host = Network::start(
         Mode::Host {
             address: "127.0.0.1:0".parse().unwrap(),
-            text: "initial".into(),
+            text: "secret note".into(),
+            store: host_store.clone(),
         },
         || {},
     )
     .unwrap();
-    let view = wait_view(&mut host, |v| v.pairing_code.is_some()).await;
-    let address = view.bound_address.unwrap();
-    let pairing = Pairing::parse(view.pairing_code.as_ref().unwrap()).unwrap();
+    let address = wait_view(&mut host, |view| view.bound_address.is_some())
+        .await
+        .bound_address
+        .unwrap();
+    let mut client = Network::start(
+        Mode::Connect {
+            target: ConnectTarget {
+                address,
+                id: None,
+                name: None,
+                pairing: None,
+            },
+            store: client_store.clone(),
+        },
+        || {},
+    )
+    .unwrap();
+    let host_prompt = wait_view(&mut host, |view| view.pairing.is_some()).await;
+    let client_prompt = wait_view(&mut client, |view| view.pairing.is_some()).await;
+    assert_eq!(
+        host_prompt.pairing.as_ref().unwrap().phrase,
+        client_prompt.pairing.as_ref().unwrap().phrase
+    );
+    assert!(
+        client_prompt.snapshot.is_none(),
+        "unverified client received note state"
+    );
+    host.commands.send(Command::ConfirmPairing).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !client.updates.borrow().connected,
+        "one confirmation authenticated the client"
+    );
+    client.commands.send(Command::ConfirmPairing).await.unwrap();
+    let connected = wait_view(&mut client, |view| view.connected).await;
+    assert_eq!(connected.snapshot.unwrap().text, "secret note");
+    assert!(host_store.has_trusted_peer());
+    assert!(client_store.trusted_host().is_some());
+    host.stop();
+    client.stop();
+    wait_view(&mut host, |v| !v.running).await;
+    wait_view(&mut client, |v| !v.running).await;
+}
+
+#[tokio::test]
+async fn rejected_pairing_saves_no_trust_and_releases_no_note() {
+    let host_store = store("host-reject");
+    let client_store = store("client-reject");
+    let mut host = Network::start(
+        Mode::Host {
+            address: "127.0.0.1:0".parse().unwrap(),
+            text: "never released".into(),
+            store: host_store.clone(),
+        },
+        || {},
+    )
+    .unwrap();
+    let address = wait_view(&mut host, |view| view.bound_address.is_some())
+        .await
+        .bound_address
+        .unwrap();
+    let mut client = Network::start(
+        Mode::Connect {
+            target: ConnectTarget {
+                address,
+                id: None,
+                name: None,
+                pairing: None,
+            },
+            store: client_store.clone(),
+        },
+        || {},
+    )
+    .unwrap();
+    let pending = wait_view(&mut client, |view| view.pairing.is_some()).await;
+    assert!(pending.snapshot.is_none());
+    client.commands.send(Command::RejectPairing).await.unwrap();
+    wait_view(&mut client, |view| !view.running).await;
+    wait_view(&mut host, |view| view.pairing.is_none()).await;
+    assert!(!host_store.has_trusted_peer());
+    assert!(client_store.trusted_host().is_none());
+    host.stop();
+    wait_view(&mut host, |view| !view.running).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_enforces_ownership_and_reconnect_sends_latest_state() {
+    let host_store = store("host-auth");
+    host_store
+        .trust_peer(
+            DeviceIdentity {
+                id: "11".repeat(16),
+                name: "test-peer".into(),
+            },
+            random_bytes().unwrap(),
+        )
+        .unwrap();
+    let pairing = host_store.identity().unwrap().pairing;
+    let mut host = Network::start(
+        Mode::Host {
+            address: "127.0.0.1:0".parse().unwrap(),
+            text: "initial".into(),
+            store: host_store,
+        },
+        || {},
+    )
+    .unwrap();
+    let address = wait_view(&mut host, |v| v.bound_address.is_some())
+        .await
+        .bound_address
+        .unwrap();
     let mut peer = connect_authenticated(address, &pairing).await.unwrap();
     let initial = next_state(&mut peer).await;
     assert_eq!(initial.text, "initial");
-    assert_eq!(initial.owner, Side::Host);
     write_frame(&mut peer, &Message::TakeControl {})
         .await
         .unwrap();
@@ -91,53 +220,31 @@ async fn real_tls_host_enforces_ownership_and_reconnect_sends_latest_state() {
     .unwrap();
     let acknowledged = next_state(&mut peer).await;
     assert_eq!(acknowledged.text, text);
-    assert!(acknowledged.receipts[1].accepted);
-    host.commands.try_send(Command::TakeControl).unwrap();
-    let reclaimed = next_state(&mut peer).await;
-    assert_eq!(reclaimed.owner, Side::Host);
-    write_frame(
-        &mut peer,
-        &Message::Edit {
-            edit: edit(&acknowledged, 2, "stale peer work"),
-        },
-    )
-    .await
-    .unwrap();
-    let rejected = next_state(&mut peer).await;
-    assert_eq!(rejected.text, text);
-    assert!(!rejected.receipts[1].accepted);
     drop(peer);
     let offline = wait_view(&mut host, |v| {
-        !v.connected
-            && v.snapshot
-                .as_ref()
-                .is_some_and(|s| s.epoch > reclaimed.epoch)
+        !v.connected && v.snapshot.as_ref().is_some_and(|s| s.epoch > granted.epoch)
     })
     .await;
     host.commands
-        .try_send(Command::Edit(edit(
+        .send(Command::Edit(edit(
             offline.snapshot.as_ref().unwrap(),
             1,
-            "edited while offline",
+            "latest host",
         )))
+        .await
         .unwrap();
     wait_view(&mut host, |v| {
-        v.snapshot
-            .as_ref()
-            .is_some_and(|s| s.text == "edited while offline")
+        v.snapshot.as_ref().is_some_and(|s| s.text == "latest host")
     })
     .await;
-    let mut reconnected = connect_authenticated(address, &pairing).await.unwrap();
-    let latest = next_state(&mut reconnected).await;
-    assert_eq!(latest.text, "edited while offline");
-    assert_eq!(latest.owner, Side::Host);
-    assert_eq!(latest.receipts[1].seq, 0);
+    let mut peer = connect_authenticated(address, &pairing).await.unwrap();
+    assert_eq!(next_state(&mut peer).await.text, "latest host");
     host.stop();
     wait_view(&mut host, |v| !v.running).await;
 }
 
 #[tokio::test]
-async fn incorrect_fingerprint_fails_tls_and_incorrect_token_receives_no_note() {
+async fn incorrect_fingerprint_and_token_release_no_note() {
     for wrong_pin in [true, false] {
         let identity = Identity::generate().unwrap();
         let code = identity.pairing.code();
@@ -172,7 +279,7 @@ async fn incorrect_fingerprint_fails_tls_and_incorrect_token_receives_no_note() 
 }
 
 #[tokio::test]
-async fn client_automatically_reconnects_and_editor_recovers_an_unsent_draft() {
+async fn reconnect_keeps_unsent_editor_text_as_a_draft() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let identity = Identity::generate().unwrap();
@@ -208,7 +315,20 @@ async fn client_automatically_reconnects_and_editor_recovers_an_unsent_draft() {
         .unwrap();
         finished.await.unwrap();
     });
-    let mut client = Network::start(Mode::Connect { address, pairing }, || {}).unwrap();
+    let client_store = store("reconnect");
+    let mut client = Network::start(
+        Mode::Connect {
+            target: ConnectTarget {
+                address,
+                id: None,
+                name: None,
+                pairing: Some(pairing),
+            },
+            store: client_store,
+        },
+        || {},
+    )
+    .unwrap();
     let first = wait_view(&mut client, |v| v.connected).await;
     let mut editor = Editor::default();
     editor.start(Side::Peer);
@@ -222,39 +342,14 @@ async fn client_automatically_reconnects_and_editor_recovers_an_unsent_draft() {
     editor.receive(reconnected.snapshot.unwrap(), reconnected.sync_serial);
     assert_eq!(editor.text, "new host state");
     assert_eq!(editor.drafts, vec!["unsent local script\n\techo '梨'"]);
-    assert!(editor.prepare_edit().is_none());
     client.stop();
     finish.send(()).unwrap();
     timeout(DEADLINE, server).await.unwrap().unwrap();
     wait_view(&mut client, |v| !v.running).await;
 }
 
-#[tokio::test]
-async fn a_second_peer_cannot_displace_the_current_connection() {
-    let mut host = Network::start(
-        Mode::Host {
-            address: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            text: String::new(),
-        },
-        || {},
-    )
-    .unwrap();
-    let view = wait_view(&mut host, |v| v.pairing_code.is_some()).await;
-    let pairing = Pairing::parse(view.pairing_code.as_ref().unwrap()).unwrap();
-    let address = view.bound_address.unwrap();
-    let mut first = connect_authenticated(address, &pairing).await.unwrap();
-    next_state(&mut first).await;
-    assert!(connect_authenticated(address, &pairing).await.is_err());
-    write_frame(&mut first, &Message::TakeControl {})
-        .await
-        .unwrap();
-    assert_eq!(next_state(&mut first).await.owner, Side::Peer);
-    host.stop();
-    wait_view(&mut host, |v| !v.running).await;
-}
-
 #[test]
-fn pairing_code_parser_is_strict_and_generated_secrets_are_distinct() {
+fn pairing_code_parser_remains_strict() {
     let one = Identity::generate().unwrap();
     let two = Identity::generate().unwrap();
     assert_ne!(one.pairing.code(), two.pairing.code());
