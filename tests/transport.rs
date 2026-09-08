@@ -8,7 +8,7 @@ use pair::{
     editor::Editor,
     network::{
         Command, ConnectTarget, Mode, Network, View, accept_authenticated, connect_authenticated,
-        connect_authenticated_first,
+        connect_authenticated_first, connect_provisional,
     },
     persistence::{DeviceIdentity, Store},
     protocol::{MAX_FRAME_BYTES, Message, read_frame, write_frame},
@@ -177,18 +177,73 @@ async fn rejected_pairing_saves_no_trust_and_releases_no_note() {
 }
 
 #[tokio::test]
+async fn interrupted_pairing_before_client_storage_leaves_no_host_trust() {
+    let host_store = store("host-interrupted");
+    let mut host = Network::start(
+        Mode::Host {
+            address: "127.0.0.1:0".parse().unwrap(),
+            text: "private".into(),
+            store: host_store.clone(),
+        },
+        || {},
+    )
+    .unwrap();
+    let address = wait_view(&mut host, |view| view.bound_address.is_some())
+        .await
+        .bound_address
+        .unwrap();
+    let (mut stream, _) = connect_provisional(address).await.unwrap();
+    write_frame(
+        &mut stream,
+        &Message::PairRequest {
+            version: pair::protocol::VERSION,
+            device_id: "44".repeat(16),
+            device_name: "Interrupted".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut stream, pair::protocol::MAX_PAIRING_BYTES)
+            .await
+            .unwrap(),
+        Message::PairReady { .. }
+    ));
+    write_frame(&mut stream, &Message::PairConfirm {})
+        .await
+        .unwrap();
+    wait_view(&mut host, |view| {
+        view.pairing.as_ref().is_some_and(|p| p.peer_confirmed)
+    })
+    .await;
+    host.commands.send(Command::ConfirmPairing).await.unwrap();
+    assert!(matches!(
+        read_frame(&mut stream, pair::protocol::MAX_PAIRING_BYTES)
+            .await
+            .unwrap(),
+        Message::PairGranted { .. }
+    ));
+    drop(stream);
+    wait_view(&mut host, |view| view.pairing.is_none()).await;
+    assert!(!host_store.has_trusted_peer());
+    host.stop();
+    wait_view(&mut host, |view| !view.running).await;
+}
+
+#[tokio::test]
 async fn authenticated_host_enforces_ownership_and_reconnect_sends_latest_state() {
     let host_store = store("host-auth");
+    let token = random_bytes().unwrap();
     host_store
         .trust_peer(
             DeviceIdentity {
                 id: "11".repeat(16),
                 name: "test-peer".into(),
             },
-            random_bytes().unwrap(),
+            token,
         )
         .unwrap();
-    let pairing = host_store.identity().unwrap().pairing;
+    let pairing = Pairing::new(host_store.identity().unwrap().pairing.fingerprint, token);
     let mut host = Network::start(
         Mode::Host {
             address: "127.0.0.1:0".parse().unwrap(),

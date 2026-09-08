@@ -110,10 +110,9 @@ fn forgetting_revokes_tokens_and_corrupt_settings_fail_closed() {
             [9; 32],
         )
         .unwrap();
-    let old = store.identity().unwrap().pairing;
+    assert!(store.token_authenticates(&"09".repeat(32)));
     store.forget_peer(&"56".repeat(16)).unwrap();
-    let new = store.identity().unwrap().pairing;
-    assert!(!new.authenticates(&old.token()));
+    assert!(!store.token_authenticates(&"09".repeat(32)));
     assert!(!store.has_trusted_peer());
     std::fs::write(&path, b"{broken").unwrap();
     assert!(Store::load(path).is_err());
@@ -140,6 +139,22 @@ fn two_peers_authenticate_and_removal_is_individual() {
     assert!(!store.token_authenticates(&"01".repeat(32)));
     assert!(store.token_authenticates(&"02".repeat(32)));
     assert_eq!(store.trusted_peers().len(), 1);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn repairing_an_existing_peer_rotates_its_token_without_using_another_slot() {
+    let (path, directory) = location("repair");
+    let store = Store::load(path).unwrap();
+    let peer = DeviceIdentity {
+        id: "30".repeat(16),
+        name: "Mac".into(),
+    };
+    store.trust_peer(peer.clone(), [3; 32]).unwrap();
+    store.trust_peer(peer, [4; 32]).unwrap();
+    assert_eq!(store.trusted_peers().len(), 1);
+    assert!(!store.token_authenticates(&"03".repeat(32)));
+    assert!(store.token_authenticates(&"04".repeat(32)));
     let _ = std::fs::remove_dir_all(directory);
 }
 

@@ -291,7 +291,7 @@ pub async fn connect_authenticated(
     }).await.map_err(|_| "Connection timed out. Check the host, port, and firewall.".to_string())?
 }
 
-async fn connect_provisional(
+pub async fn connect_provisional(
     address: SocketAddr,
 ) -> Result<(TlsStream<TcpStream>, [u8; 32]), String> {
     timeout(IO_TIMEOUT, async {
@@ -681,10 +681,9 @@ async fn run_client(
         publisher.publish();
         let result = match connect_authenticated_first(&target.addresses, &pairing).await {
             Ok((stream, address)) => {
-                store.update_host_address(address)?;
                 prioritize_address(&mut target.addresses, address);
                 retry = 0;
-                client_session(stream, commands, publisher).await
+                client_session(stream, commands, publisher, &store, address).await
             }
             Err(error) => Err(error),
         };
@@ -766,6 +765,9 @@ async fn client_pair_session(
                 "Application version mismatch; host expects protocol {expected}."
             ));
         }
+        Message::PairRejected {
+            reason: PairingError::TrustListFull,
+        } => return Err("Host trust list full. Remove a paired device on the host.".into()),
         _ => return Err("Host rejected pairing or is already paired.".into()),
     };
     if target
@@ -849,6 +851,8 @@ async fn client_session(
     mut stream: TlsStream<TcpStream>,
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
+    store: &Store,
+    address: SocketAddr,
 ) -> Result<(), String> {
     let first = timeout(IO_TIMEOUT, read_frame(&mut stream, MAX_FRAME_BYTES))
         .await
@@ -871,6 +875,7 @@ async fn client_session(
     publisher.view.sync_serial += 1;
     publisher.view.snapshot = Some(snapshot);
     publisher.view.connected = true;
+    store.update_host_address(address)?;
     publisher.view.status = "Connected to host (TLS 1.3, pinned certificate).".into();
     publisher.publish();
     let (mut reader, mut writer) = split(stream);

@@ -49,7 +49,9 @@ enum Action {
     ToggleHelp,
     ToggleHostAdvanced,
     SaveName,
+    SaveConnectName,
     RemovePeer,
+    ForgetHost,
     ResetIdentity,
     Changed,
     Flush,
@@ -79,6 +81,7 @@ struct Ui {
     peers: Choice,
     remove_peer: Button,
     nearby: Choice,
+    connect_name: Input,
     connect_status: Frame,
     connect_phrase: Frame,
     connect_confirm: Button,
@@ -100,6 +103,7 @@ struct Ui {
     discovery: Option<DiscoveryBrowser>,
     discovered: Vec<DiscoveredDevice>,
     targets: Vec<ConnectTarget>,
+    active_target_id: Option<String>,
     pairing: Option<PairingPrompt>,
     store: Store,
     tx: mpsc::Sender<Action>,
@@ -141,7 +145,6 @@ fn icon(mut frame: Frame, host: bool) {
     });
 }
 fn choose_font() {
-    app::load_system_fonts();
     let fonts = app::fonts();
     let choices: &[&str] = if cfg!(target_os = "windows") {
         &["MS Reference Sans Serif", "Segoe UI"]
@@ -152,9 +155,9 @@ fn choose_font() {
     };
     if let Some(name) = choices
         .iter()
-        .find(|name| fonts.iter().any(|font| font == **name))
+        .find(|name| fonts.iter().any(|font| font.as_str() == **name))
     {
-        app::set_font(Font::Helvetica, name);
+        Font::set_font(Font::Helvetica, name);
     }
 }
 
@@ -221,8 +224,12 @@ impl Ui {
 
         let mut connect = Group::new(0, 0, 900, 650, None);
         heading(Frame::new(0, 35, 900, 45, None), "Connect to a note", 30);
-        let mut nearby = Choice::new(245, 112, 410, 38, "Nearby  ");
-        let mut connect_button = Button::new(380, 164, 180, 40, "Connect");
+        let mut connect_name = Input::new(285, 82, 300, 30, "This computer  ");
+        connect_name.set_value(&device.name);
+        let mut save_connect_name = Button::new(595, 82, 95, 30, "Save name");
+        flat(&mut save_connect_name);
+        let mut nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
+        let mut connect_button = Button::new(380, 177, 180, 40, "Connect");
         flat(&mut connect_button);
         let mut connect_status = Frame::new(120, 220, 660, 56, "Searching for nearby computers...");
         connect_status.set_align(Align::Center | Align::Inside | Align::Wrap);
@@ -244,10 +251,12 @@ impl Ui {
         flat(&mut manual_connect);
         let mut refresh = Button::new(225, 538, 105, 30, "Refresh");
         flat(&mut refresh);
+        let mut forget_host = Button::new(340, 538, 135, 30, "Forget host");
+        flat(&mut forget_host);
         let mut help = Frame::new(
-            340,
+            485,
             532,
-            355,
+            210,
             48,
             "Allow Pair on Private networks. On macOS, enable Local Network access.",
         );
@@ -308,30 +317,30 @@ impl Ui {
                 }
             }
         });
-        for (button, action) in [
-            (&mut open_host, Action::OpenHost as fn() -> Action),
-            (&mut open_connect, || Action::OpenConnect),
-            (&mut host_back, || Action::Back),
-            (&mut connect_back, || Action::Back),
-            (&mut connect_button, || Action::ConnectNearby),
-            (&mut manual_connect, || Action::ConnectManual),
-            (&mut refresh, || Action::Refresh),
-            (&mut toggle_help, || Action::ToggleHelp),
-            (&mut toggle_host_advanced, || Action::ToggleHostAdvanced),
-            (&mut save_name, || Action::SaveName),
-            (&mut remove_peer, || Action::RemovePeer),
-            (&mut reset, || Action::ResetIdentity),
-            (&mut host_confirm, || Action::ConfirmPairing),
-            (&mut host_reject, || Action::RejectPairing),
-            (&mut connect_confirm, || Action::ConfirmPairing),
-            (&mut connect_reject, || Action::RejectPairing),
-            (&mut take, || Action::TakeControl),
-            (&mut copy, || Action::CopyAll),
-            (&mut draft, || Action::Drafts),
-            (&mut disconnect, || Action::Disconnect),
-        ] {
-            callback(button, &tx, action);
-        }
+        callback(&mut open_host, &tx, || Action::OpenHost);
+        callback(&mut open_connect, &tx, || Action::OpenConnect);
+        callback(&mut host_back, &tx, || Action::Back);
+        callback(&mut connect_back, &tx, || Action::Back);
+        callback(&mut connect_button, &tx, || Action::ConnectNearby);
+        callback(&mut manual_connect, &tx, || Action::ConnectManual);
+        callback(&mut refresh, &tx, || Action::Refresh);
+        callback(&mut toggle_help, &tx, || Action::ToggleHelp);
+        callback(&mut toggle_host_advanced, &tx, || {
+            Action::ToggleHostAdvanced
+        });
+        callback(&mut save_name, &tx, || Action::SaveName);
+        callback(&mut save_connect_name, &tx, || Action::SaveConnectName);
+        callback(&mut remove_peer, &tx, || Action::RemovePeer);
+        callback(&mut forget_host, &tx, || Action::ForgetHost);
+        callback(&mut reset, &tx, || Action::ResetIdentity);
+        callback(&mut host_confirm, &tx, || Action::ConfirmPairing);
+        callback(&mut host_reject, &tx, || Action::RejectPairing);
+        callback(&mut connect_confirm, &tx, || Action::ConfirmPairing);
+        callback(&mut connect_reject, &tx, || Action::RejectPairing);
+        callback(&mut take, &tx, || Action::TakeControl);
+        callback(&mut copy, &tx, || Action::CopyAll);
+        callback(&mut draft, &tx, || Action::Drafts);
+        callback(&mut disconnect, &tx, || Action::Disconnect);
         window.set_callback({
             let tx = tx.clone();
             move |_| {
@@ -355,6 +364,7 @@ impl Ui {
             peers,
             remove_peer,
             nearby,
+            connect_name,
             connect_status,
             connect_phrase,
             connect_confirm,
@@ -376,6 +386,7 @@ impl Ui {
             discovery: None,
             discovered: Vec::new(),
             targets: Vec::new(),
+            active_target_id: None,
             pairing: None,
             store,
             tx,
@@ -441,6 +452,7 @@ impl Ui {
         )
     }
     fn connect_target(&mut self, target: ConnectTarget) -> Result<(), String> {
+        self.active_target_id = target.id.clone();
         self.start_network(
             Mode::Connect {
                 target,
@@ -490,7 +502,9 @@ impl Ui {
                 device.name,
                 if saved.is_some() { "  —  Paired" } else { "" }
             ));
-            if let Some(network) = &self.network {
+            if self.active_target_id.as_ref() == Some(&device.id)
+                && let Some(network) = &self.network
+            {
                 let _ = network
                     .commands
                     .try_send(Command::UpdateAddresses(addresses));
@@ -552,6 +566,7 @@ impl Ui {
                 }
                 self.network = None;
                 self.discovery = None;
+                self.active_target_id = None;
                 self.model.connection(false, false);
                 self.show(Screen::Landing);
             }
@@ -575,10 +590,7 @@ impl Ui {
                 }
                 let address = SocketAddr::new(ip, Self::parse_port(&self.manual_port.value())?);
                 let trusted = self.store.trusted_host();
-                let pairing = trusted
-                    .as_ref()
-                    .filter(|host| host.address == address)
-                    .map(|host| host.pairing.clone());
+                let pairing = trusted.as_ref().map(|host| host.pairing.clone());
                 self.connect_target(ConnectTarget {
                     addresses: vec![address],
                     id: trusted.as_ref().map(|host| host.id.clone()),
@@ -605,6 +617,10 @@ impl Ui {
                 self.store.set_name(&self.host_name.value())?;
                 self.notice = "Device name saved. Restart Host to advertise it.".into();
             }
+            Action::SaveConnectName => {
+                self.store.set_name(&self.connect_name.value())?;
+                self.notice = "Device name saved.".into();
+            }
             Action::RemovePeer => {
                 let peers = self.store.trusted_peers();
                 if let Some(peer) = peers.get(self.peers.value().max(0) as usize) {
@@ -612,6 +628,16 @@ impl Ui {
                     self.notice = format!("Removed {}.", peer.name);
                     self.refresh_peers();
                 }
+            }
+            Action::ForgetHost => {
+                if let Some(network) = &self.network {
+                    network.stop();
+                }
+                self.network = None;
+                self.model.connection(false, false);
+                self.store.forget_host()?;
+                self.notice = "Remembered host removed. Select it to pair again.".into();
+                self.refresh_discovery();
             }
             Action::ResetIdentity => {
                 if dialog::choice2_default(
@@ -621,9 +647,15 @@ impl Ui {
                     "",
                 ) == Some(1)
                 {
+                    if let Some(network) = &self.network {
+                        network.stop();
+                    }
+                    self.network = None;
+                    self.model.connection(false, false);
                     self.store.reset_host_identity()?;
                     self.refresh_peers();
                     self.notice = "Host identity reset.".into();
+                    self.show(Screen::Landing);
                 }
             }
             Action::Changed => {
@@ -695,6 +727,8 @@ impl Ui {
         if view.connected {
             self.discovery = None;
             self.show(Screen::Workspace);
+        } else if view.running && self.model.side == Side::Peer && self.discovery.is_none() {
+            self.refresh_discovery();
         }
         if !view.running {
             self.network = None;
@@ -874,7 +908,9 @@ impl Ui {
 }
 
 pub fn run() {
-    let application = app::App::default().with_scheme(app::Scheme::Base);
+    let application = app::App::default()
+        .with_scheme(app::Scheme::Base)
+        .load_system_fonts();
     choose_font();
     app::set_font_size(14);
     let store = match Store::load_default() {
