@@ -168,7 +168,7 @@ impl Ui {
         window.set_color(BG);
         window.size_range(760, 560, 0, 0);
 
-        let mut landing = Group::new(0, 0, 900, 650, None);
+        let landing = Group::new(0, 0, 900, 650, None);
         heading(
             Frame::new(0, 52, 900, 52, None),
             "How do you want to pair?",
@@ -205,7 +205,7 @@ impl Ui {
         flat(&mut host_confirm);
         let mut host_reject = Button::new(515, 318, 105, 38, "Reject");
         flat(&mut host_reject);
-        let mut peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
+        let peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
         let mut remove_peer = Button::new(595, 390, 125, 34, "Remove");
         flat(&mut remove_peer);
         let mut toggle_host_advanced = Button::new(365, 440, 170, 32, "Advanced settings");
@@ -228,7 +228,7 @@ impl Ui {
         connect_name.set_value(&device.name);
         let mut save_connect_name = Button::new(595, 82, 95, 30, "Save name");
         flat(&mut save_connect_name);
-        let mut nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
+        let nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
         let mut connect_button = Button::new(380, 177, 180, 40, "Connect");
         flat(&mut connect_button);
         let mut connect_status = Frame::new(120, 220, 660, 56, "Searching for nearby computers...");
@@ -401,10 +401,16 @@ impl Ui {
 
     fn show(&mut self, screen: Screen) {
         self.screen = screen;
-        self.landing.set_visible(screen == Screen::Landing);
-        self.host.set_visible(screen == Screen::Host);
-        self.connect.set_visible(screen == Screen::Connect);
-        self.workspace.set_visible(screen == Screen::Workspace);
+        self.landing.hide();
+        self.host.hide();
+        self.connect.hide();
+        self.workspace.hide();
+        match screen {
+            Screen::Landing => self.landing.show(),
+            Screen::Host => self.host.show(),
+            Screen::Connect => self.connect.show(),
+            Screen::Workspace => self.workspace.show(),
+        }
         self.window.redraw();
     }
     fn refresh_peers(&mut self) {

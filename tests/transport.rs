@@ -221,6 +221,12 @@ async fn interrupted_pairing_before_client_storage_leaves_no_host_trust() {
         read_frame(&mut stream, pair::protocol::MAX_PAIRING_BYTES)
             .await
             .unwrap(),
+        Message::PairConfirm {}
+    ));
+    assert!(matches!(
+        read_frame(&mut stream, pair::protocol::MAX_PAIRING_BYTES)
+            .await
+            .unwrap(),
         Message::PairGranted { .. }
     ));
     drop(stream);

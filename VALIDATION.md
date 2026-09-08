@@ -1,5 +1,27 @@
 # Validation record
 
+## Completed for v0.3.0
+
+Validation on 2026-09-08 used Rust 1.88 in Ubuntu WSL on Windows x64:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --locked` | Passed |
+| `cargo clippy --all-targets --locked -- -D warnings` | Passed |
+| `cargo test --all-targets --locked` | 32 tests passed |
+| `cargo build --release --locked` | Passed |
+
+The added tests cover settings migration, independent peer-token revocation,
+repair-token rotation, interrupted pairing before client storage, multiple
+discovered addresses including direct-Ethernet link-local addresses, and
+fallback from an unreachable address to a working address.
+
+The role-first interface compiled but was not opened in this headless WSL
+environment. Cross-device discovery, macOS Local Network permission behavior,
+and direct-cable behavior still require physical-device checks. No new memory
+or latency measurement was made.
+
 Validation below was performed on 2026-09-07 on Windows x64 with the repository's
 portable GNU toolchain. Dependency versions are locked in `Cargo.lock`.
 

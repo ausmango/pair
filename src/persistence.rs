@@ -280,10 +280,10 @@ impl Store {
         self.data.lock().is_ok_and(|data| {
             let mut matched = 0u8;
             for peer in &data.trusted_peers {
-                if let Ok(token) =
-                    unhex(&peer.token, 32).and_then(|v| v.try_into().map_err(|_| "bad token"))
-                {
-                    matched |= u8::from(token.ct_eq(&candidate));
+                let token: Result<[u8; 32], _> =
+                    unhex(&peer.token, 32).and_then(|v| v.try_into().map_err(|_| "bad token"));
+                if let Ok(token) = token {
+                    matched |= token.ct_eq(&candidate).unwrap_u8();
                 }
             }
             matched == 1
