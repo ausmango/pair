@@ -122,5 +122,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "pair $GITHUB_REF_NAME" \
             --notes "Native encrypted LAN notepad with nearby-host discovery and one-time phrase verification. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
