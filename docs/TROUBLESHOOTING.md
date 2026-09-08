@@ -50,9 +50,9 @@ release archive:
 
 ```sh
 cd ~/Downloads
-mkdir -p pair-v0.2.0
-tar -xzf pair-linux-arm64-jetpack4.tar.gz -C pair-v0.2.0
-cd pair-v0.2.0
+mkdir -p pair-release
+tar -xzf pair-linux-arm64-jetpack4.tar.gz -C pair-release
+cd pair-release
 sh install-desktop.sh
 ```
 
