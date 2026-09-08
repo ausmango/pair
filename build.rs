@@ -8,8 +8,13 @@ fn main() {
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     let icon = fs::canonicalize("assets/pair.ico").expect("pair icon exists");
+    let icon = icon.to_string_lossy();
+    let icon = icon
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&icon)
+        .replace('\\', "/");
     let rc = out.join("pair.rc");
-    fs::write(&rc, format!("1 ICON \"{}\"\n", icon.display())).expect("write icon resource");
+    fs::write(&rc, format!("1 ICON \"{icon}\"\n")).expect("write icon resource");
 
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let resource = if target_env == "msvc" {
