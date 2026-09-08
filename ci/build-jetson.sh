@@ -23,7 +23,7 @@ tar -xzf "/tmp/$cmake_archive" --strip-components=1 -C /opt/cmake
 export PATH="/opt/cmake/bin:$PATH"
 
 curl --proto '=https' --tlsv1.2 -fL https://sh.rustup.rs -o /tmp/rustup-init.sh
-sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1
+sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88.0
 . /root/.cargo/env
 
 rustc --version

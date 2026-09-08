@@ -1,4 +1,4 @@
-name: Build Jetson release
+name: Build desktop releases
 
 on:
   workflow_dispatch:
@@ -10,39 +10,115 @@ permissions:
   contents: write
 
 jobs:
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0-x86_64-pc-windows-msvc
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item target/release/pair.exe,README.md,LICENSE dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath dist/pair-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pair-windows-x64
+          path: dist/pair-windows-x64.zip
+
+  linux-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in an Ubuntu 20.04 userspace
+        run: docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work ubuntu:20.04 bash ci/build-linux-x64.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pair-linux-x64
+          path: dist/pair-linux-x64.tar.gz
+
   jetson-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
       - name: Build in the JetPack 4 userspace generation
-        run: |
-          docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/work" \
-            --workdir /work \
-            ubuntu:18.04 \
-            bash ci/build-jetson.sh
-
+        run: docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work ubuntu:18.04 bash ci/build-jetson.sh
       - name: Package
-        run: |
-          tar -czf "$GITHUB_WORKSPACE/dist/pair-linux-arm64-jetpack4.tar.gz" -C dist/jetson pair JETSON.md LINKED-LIBRARIES.txt
-          cd dist
-          sha256sum pair-linux-arm64-jetpack4.tar.gz > pair-linux-arm64-jetpack4.tar.gz.sha256
-
+        run: tar -czf dist/pair-linux-arm64-jetpack4.tar.gz -C dist/jetson pair JETSON.md LINKED-LIBRARIES.txt
       - uses: actions/upload-artifact@v4
         with:
           name: pair-linux-arm64-jetpack4
-          path: |
-            dist/pair-linux-arm64-jetpack4.tar.gz
-            dist/pair-linux-arm64-jetpack4.tar.gz.sha256
+          path: dist/pair-linux-arm64-jetpack4.tar.gz
 
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: pair-macos-x64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: pair-macos-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target "${{ matrix.target }}"
+          cargo +1.88.0 build --release --locked --target "${{ matrix.target }}"
+      - name: Package app bundle
+        run: |
+          app="dist/Pair.app"
+          mkdir -p "$app/Contents/MacOS"
+          cp "target/${{ matrix.target }}/release/pair" "$app/Contents/MacOS/pair"
+          cat > "$app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>pair</string>
+            <key>CFBundleIdentifier</key><string>dev.pair.notepad</string>
+            <key>CFBundleName</key><string>Pair</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.2.0</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+          </dict></plist>
+          PLIST
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" "dist/${{ matrix.asset }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.zip
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows-x64, linux-x64, jetson-arm64, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Record checksums and sizes
+        run: |
+          cd dist
+          sha256sum pair-windows-x64.zip pair-linux-x64.tar.gz pair-linux-arm64-jetpack4.tar.gz pair-macos-x64.zip pair-macos-arm64.zip > SHA256SUMS
+          stat --printf='%n %s bytes\n' pair-windows-x64.zip pair-linux-x64.tar.gz pair-linux-arm64-jetpack4.tar.gz pair-macos-x64.zip pair-macos-arm64.zip > SIZES.txt
       - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/pair-linux-arm64-jetpack4.tar.gz \
-            dist/pair-linux-arm64-jetpack4.tar.gz.sha256 \
+          gh release create "$GITHUB_REF_NAME" dist/* \
             --title "pair $GITHUB_REF_NAME" \
-            --notes "Windows/Linux LAN notepad. The ARM64 archive is built in Ubuntu 18.04 for the original Jetson Nano / JetPack 4 userspace generation. Linux hardware validation is still pending."
+            --notes "Native encrypted LAN notepad with nearby-host discovery and one-time phrase verification. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
