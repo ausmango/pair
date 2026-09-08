@@ -1,339 +1,82 @@
 # pair
 
-A small native notepad shared by two computers on a local network. Paste a
-command or script on one computer and copy it on the other. Nothing is executed.
-No browser, cloud, accounts, database, clipboard monitoring, telemetry, or text
-logging. The first pass deliberately has a plain interface and no custom logo.
+Pair is a tiny native notepad shared between two computers on the same local
+network. Paste a command, script, or any plain text on one computer and it
+appears on the other in about 75 ms.
 
-## Build and run
+Pair never executes received text. It has no browser, cloud service, account,
+database, clipboard monitoring, telemetry, or note logging.
 
-Use Rust **1.88 or newer**, Git, a C/C++ compiler, and **CMake 3.28 or newer**.
-Keep `Cargo.lock` and build with `--locked`. FLTK is built from the crate's
-included C++ source and linked into the executable; there is no binary download
-at application startup. A compiler, Cargo, and CMake are build prerequisites,
-not requirements on the receiving computer.
+## Download
 
-### Windows 10/11, x64
+Download the archive for your computer from the
+[latest release](https://github.com/ausmango/pair/releases/latest):
 
-MSVC route: install [Rust via rustup](https://www.rust-lang.org/tools/install),
-Visual Studio Build Tools with **Desktop development with C++**, the Windows
-SDK, and CMake 3.28+. Open its **x64 Native Tools Command Prompt**, change to this
-repository, and run:
+| System | File |
+| --- | --- |
+| Windows 10/11 x64 | `pair-windows-x64.zip` |
+| Linux x64 | `pair-linux-x64.tar.gz` |
+| NVIDIA Jetson Nano / JetPack 4 ARM64 | `pair-linux-arm64-jetpack4.tar.gz` |
+| macOS 12+ Intel | `pair-macos-x64.zip` |
+| macOS 12+ Apple Silicon | `pair-macos-arm64.zip` |
 
-```bat
-rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
-cargo +stable-x86_64-pc-windows-msvc build --release --locked
-target\release\pair.exe
-```
+Verify a download against `SHA256SUMS` when possible. Windows and macOS builds
+are currently unsigned. macOS builds are produced in CI but have not yet been
+tested on physical Macs.
 
-Alternatively, use a GCC-MinGW distribution (the route exercised during
-development). Put its `bin` directory and CMake's `bin` directory on `PATH` in
-PowerShell. It must include `gcc`, `g++`, and `mingw32-make` or Ninja. Then:
+## Use Pair
 
-```powershell
-rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rustfmt,clippy
-cargo +stable-x86_64-pc-windows-gnu build --release --locked
-.\target\release\pair.exe
-```
+1. Open Pair on both computers. Give each one a useful device name.
+2. On one computer, leave **Host** selected and click **Start Host**. On the
+   other, select **Connect**, choose the nearby host, and click **Connect**.
+3. Compare the six-word phrase on both screens. If it matches exactly, click
+   **Phrase Matches — Pair** on both computers.
 
-Use **GCC-MinGW**, not LLVM-MinGW, with Rust's `windows-gnu` target: their runtime
-libraries differ. `.cargo/config.toml` requests static Windows runtime linkage.
-Copy `target\release\pair.exe` to the other Windows machine; no FLTK DLL is
-needed. Linux requires its own build, not the Windows executable.
+Pair remembers the verified device. Later connections need one click and use
+the saved certificate pin and random reconnect token.
 
-### Linux desktop (x64 or ARM64)
+The host starts with editing control. Click **Take Control** on the other
+computer before editing there. **Copy All** copies the complete note. Tabs,
+indentation, Unicode, and line breaks are preserved.
 
-This build uses **X11**; a Wayland desktop needs XWayland. A graphical desktop
-session and a valid `DISPLAY` are required. No OpenGL, Vulkan, CUDA, GTK, Qt, or
-embedded web engine is used. Pango/Cairo are retained for font fallback and
-Unicode text drawing; available fonts still determine glyph coverage.
+If the host does not appear, enter its LAN IP and port manually. The default
+port is `47321`. Discovery uses IPv4 multicast DNS; manual IPv4 and IPv6
+connections remain available.
 
-On Ubuntu 24.04 (or a Debian-family system with CMake 3.28+):
+## Privacy and security
 
-```sh
-sudo apt-get update
-sudo apt-get install build-essential git cmake ninja-build pkg-config curl ca-certificates \
-  libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev \
-  libxrender-dev libxfixes-dev libfontconfig1-dev libpango1.0-dev libcairo2-dev
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup.sh
-sh rustup.sh -y --profile minimal --component rustfmt,clippy
-. "$HOME/.cargo/env"
-cmake --version
-cargo build --release --locked
-./target/release/pair
-```
+Pair uses TLS 1.3. The first connection is visibly marked unverified and cannot
+receive note data. The matching phrase verifies the host certificate before
+Pair stores a 256-bit reconnect token. Later connections pin that exact
+certificate and authenticate with the token.
 
-The resulting `target/release/pair` is one application executable. Linux still
-needs glibc, its C++ ABI/runtime, and the desktop libraries. On an equivalent
-Ubuntu installation, runtime packages include:
+Only device identity and pairing credentials are saved in the current user's
+application-data directory. Notes and recovery drafts stay in memory. Use
+**Forget Device** to revoke or remove saved trust.
 
-```sh
-sudo apt-get install libx11-6 libxext6 libxft2 libxinerama1 libxcursor1 \
-  libxrender1 libxfixes3 libfontconfig1 libcairo2 libpango-1.0-0 \
-  libpangocairo-1.0-0 libpangoxft-1.0-0 libstdc++6
-ldd ./pair
-./pair
-```
+Read [the security design](docs/SECURITY.md) for the full pairing flow and
+threat model.
 
-Run `ldd` after copying the executable to check for missing libraries. Build on
-the oldest distribution you intend to run on; an executable built against a
-newer glibc may not run on an older system. This is not a fully static Linux
-binary.
+## Platform status
 
-### Original NVIDIA Jetson Nano
+| Platform | Status |
+| --- | --- |
+| Windows x64 | Built and tested during development |
+| Original Jetson Nano ARM64 | User-confirmed on physical hardware; exact JetPack version was not recorded |
+| Linux x64 | Built in CI; desktop runtime depends on common X11/Pango libraries |
+| macOS Intel / Apple Silicon | CI build target; physical runtime validation pending |
 
-The original Nano is different from the **Orin Nano**. NVIDIA's final official
-JetPack 4 release, **4.6.6 / L4T 32.7.6**, supports the Nano and uses an Ubuntu
-18.04 filesystem and Linux 4.9. This is the intended baseline to investigate,
-not a tested compatibility claim. [NVIDIA release documentation](https://developer.nvidia.com/embedded/linux-tegra-r3276)
+Linux uses X11 and works under Wayland through XWayland. Pair does not require
+OpenGL, Vulkan, CUDA, GTK, Qt, or an embedded web engine.
 
-Rust documents `aarch64-unknown-linux-gnu` with a kernel 4.1+ / glibc 2.17+
-baseline. That makes this target plausible for stock JetPack 4, but does not
-establish that this app, its compiler build tools, fonts, or native dependencies
-work on a particular Nano image. **No Jetson or Linux system was available for
-runtime testing here.** [Rust platform support](https://doc.rust-lang.org/rustc/platform-support.html)
+## More information
 
-The easiest password-free route is the tagged GitHub release. On the Jetson's
-graphical desktop, download `pair-linux-arm64-jetpack4.tar.gz` from the
-[latest release](https://github.com/ausmango/pair/releases/latest), then:
+- [Build from source](docs/BUILDING.md)
+- [Connection, firewall, and Jetson help](docs/TROUBLESHOOTING.md)
+- [Security and stored data](docs/SECURITY.md)
+- [Development validation](VALIDATION.md)
 
-```sh
-cd ~/Downloads
-tar -xzf pair-linux-arm64-jetpack4.tar.gz
-chmod +x pair
-./pair
-```
-
-This requires no `sudo`, administrator password, Rust installation, or compiler.
-The release is built by GitHub Actions in an ARM64 Ubuntu 18.04 container. It is
-intended for the original Nano/JetPack 4 userspace generation but remains
-unverified until exercised on physical Jetson hardware.
-
-On the Nano:
-
-1. Check `uname -m` (`aarch64`), `cat /etc/nv_tegra_release`,
-   `lsb_release -ds`, `ldd --version`, and `echo "$DISPLAY"`. Use a local X11
-   desktop, not a bare SSH shell. Do not replace JetPack/CUDA to install pair.
-2. Install the Linux development packages above. Ubuntu 18.04's original
-   CMake is too old; Ubuntu 22.04's default CMake is also below this project's
-   minimum. If necessary, build a newer CMake locally using the steps below.
-3. Install current Rust using the Linux steps above (do not rely on Ubuntu
-   18.04's old packaged Rust). From this repository, build conservatively:
-
-   ```sh
-   . "$HOME/.cargo/env"
-   CARGO_BUILD_JOBS=1 cargo build --release --locked --target aarch64-unknown-linux-gnu
-   ./target/aarch64-unknown-linux-gnu/release/pair
-   ```
-
-   Compile while memory-intensive research is stopped, or build in a matching
-   ARM64 environment elsewhere. Build-time memory has not been measured.
-
-For older distributions, these commands build CMake 3.31.8 from its official
-source release, without replacing the system CMake:
-
-```sh
-sudo apt-get install build-essential libssl-dev
-mkdir -p "$HOME/pair-build-tools"
-cd "$HOME/pair-build-tools"
-curl -fLO https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8.tar.gz
-curl -fLO https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-SHA-256.txt
-grep 'cmake-3.31.8.tar.gz$' cmake-3.31.8-SHA-256.txt | sha256sum -c -
-tar xf cmake-3.31.8.tar.gz
-cd cmake-3.31.8
-./bootstrap --prefix="$HOME/.local" --parallel=1
-make -j1
-make install
-export PATH="$HOME/.local/bin:$PATH"
-cmake --version
-```
-
-Return to the pair repository before running Cargo. These Nano prerequisite
-steps are documented, **not executed on Nano**. Third-party Nano Ubuntu images
-and Orin/JetPack 5/6 installations need separate validation. Cross-compilation
-also needs an ARM64 compiler and an appropriate X11/Pango/Cairo/glibc sysroot;
-`rustup target add` alone does not provide those native dependencies.
-
-#### Building on the Jetson without sudo
-
-The included helper installs current Rust and a prebuilt ARM64 CMake under your
-home directory and builds with one job to limit peak memory:
-
-```sh
-cd pair
-sh scripts/build-linux-user.sh
-./target/release/pair
-```
-
-The script itself never uses `sudo`. It first checks for the system pieces that
-cannot reliably be supplied by a Rust project: `c++`, `make`, `pkg-config`, and
-the X11/Pango/Cairo development metadata. If that check passes, no administrator
-step is needed. If it reports missing packages, ask an administrator to run this
-once on the Jetson:
-
-```sh
-sudo apt-get update
-sudo apt-get install build-essential pkg-config curl ca-certificates \
-  libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev \
-  libxrender-dev libxfixes-dev libfontconfig1-dev libpango1.0-dev libcairo2-dev
-```
-
-Afterward, your normal user can rerun the helper; the administrator does not
-need to build or run pair. If you have no sudo/admin access and the check fails,
-use a binary built on the same JetPack/glibc generation instead. A Windows build
-cannot produce that binary merely by adding Rust's ARM64 target because the
-Linux GUI libraries and Jetson-compatible sysroot are also required.
-
-FLTK was selected after checking its Windows/Linux build requirements and
-ARM64 cross-compilation support. This project pins `fltk` 1.5.23, whose packaged
-`cfltk/CMakeLists.txt` requires CMake 3.28. OpenGL and image decoding are disabled;
-Pango/Cairo and X11 are enabled on Linux. The older minimum in the general FLTK
-book does not override the pinned crate's build script.
-[FLTK setup](https://fltk-rs.github.io/fltk-book/Setup.html),
-[FLTK cross-compilation](https://fltk-rs.github.io/fltk-book/Cross-Compiling.html),
-[FLTK build options](https://github.com/fltk-rs/fltk-rs/blob/master/fltk-sys/build/source.rs)
-
-## Two-computer setup and pairing
-
-1. Put both computers on the same trusted local network. Choose either as the
-   host; it retains the shared state while the other reconnects.
-2. On that computer, launch pair, leave **Host** selected, and click
-   **Start Host**. The default is `0.0.0.0:47321` (all IPv4 interfaces). You may
-   bind to a specific local interface IP instead. IPv6 accepts a numeric IP
-   without brackets in the IP field. Scoped link-local IPv6 addresses are not
-   supported by this first-pass address field.
-3. Find the host's LAN IP with `ipconfig` on Windows or `ip -brief address` on
-   Linux; for example, `192.168.1.20`. The connecting computer must use this
-   address, not `0.0.0.0`. `127.0.0.1` is only for testing on the same computer.
-4. Click **Copy Code** on the host. The code is
-   `pair1:<64 hex fingerprint digits>:<64 hex secret digits>`. Transfer the
-   entire code through a **trusted, authenticated channel**, such as a USB
-   drive you control or an already authenticated SSH connection. Alternatively
-   transcribe it while directly viewing the host. Do not fetch it from an
-   unauthenticated LAN page, public chat, or unverified message.
-5. On the other computer, choose **Connect**, enter the host IP, matching port,
-   and the full pairing code, then click **Connect**. Connected status appears
-   only after TLS verification, secret authentication, and the initial host
-   snapshot have succeeded.
-6. The host starts with editing control. Paste in its note. Updates follow a
-   **75 ms trailing debounce**, without a Send button. To edit on the other
-   computer, click **Take Control** there and wait for the ownership label.
-   **Copy All** copies the entire note on either computer, including when it
-   is read only. Tabs, indentation, Unicode, and existing CR/LF line breaks
-   are retained by the application/protocol. OS clipboard conversions and
-   installed font coverage are outside the protocol's control.
-
-The pairing code contains a 256-bit OS-random bearer secret and the SHA-256
-fingerprint of a freshly generated host certificate. The client pins that
-**exact certificate** before sending the secret. TLS 1.3 handshake signatures
-are still verified by rustls/ring, proving possession of the certificate's
-private key. A wrong fingerprint fails closed; there is no trust-on-first-use,
-"accept any certificate," or certificate warning bypass. This local pin is the
-trust anchor instead of public certificate authorities, DNS names, or certificate
-expiry. The host then checks the secret in constant time before releasing any
-note state. This authenticates the joining device by possession of the code;
-it is not a named-device account or mutual certificate system.
-[Rustls verifier contract](https://docs.rs/rustls/latest/rustls/client/danger/trait.ServerCertVerifier.html)
-
-Keep the code private. Anyone holding it can join when no peer is connected.
-Only one peer is admitted at a time. **Stop / Start Host generates a new key,
-certificate, and secret**, revoking the old code; update the client manually.
-The identity survives cable/Wi-Fi disconnections while Host remains running.
-No pairing secret or note is saved to disk, printed, or sent to another service.
-Copy Code explicitly places the secret on your clipboard; pair does not monitor
-or clear the clipboard. Endpoint compromise and denial-of-service on the LAN
-are outside this small pairing design.
-
-## Control, reconnection, and drafts
-
-The host serializes control requests, grants one owner, and increments an
-ownership epoch on every handover. Edits carry that epoch and a base revision.
-Both host and peer edits go through the same authority checks; stale revisions,
-old connections, and non-owner edits cannot replace the note. There is no CRDT,
-merge algorithm, or last-writer-wins behavior. Simultaneous Take Control requests
-are handled in host processing order.
-
-The client reconnects automatically with delays of 1, 2, 4, then 5 seconds. A
-fresh connection always receives the latest host note and returns control to
-the host. While disconnected the peer is read only; the host can keep editing.
-Updates not yet acknowledged, including edits still inside the debounce window,
-become **recovery drafts** if connection or control changes. A draft can also
-contain an edit that reached the host but whose acknowledgement was lost.
-
-Open **Drafts** to inspect or copy a draft. **Restore** replaces the shared note
-with that draft after you have taken control; it never merges or sends drafts
-automatically on reconnection. **Discard Draft** explicitly removes it. Up to
-eight drafts are retained; when full, new editing pauses instead of evicting an
-older draft. Copy, restore, or discard one to free a slot.
-
-**Notes, drafts, and pairing keys are memory-only.** Recovery survives a network
-reconnection, not an application crash or restart. Closing warns if unsent edits
-or drafts remain. Use Copy All / Copy Draft and save elsewhere for lasting
-storage. The status “saved at host” means accepted into host memory, not disk.
-
-## Firewall and connection errors
-
-Allow inbound **TCP 47321** (or your chosen port) on the host, restricted to the
-peer or local subnet. The connecting computer needs outbound access and replies;
-no discovery or UDP ports are used. Do not add router port forwarding or expose
-pair to the internet. Guest Wi-Fi/AP isolation can block computer-to-computer
-traffic even when both devices have internet access.
-
-On Windows, allow pair on your **Private** network when prompted, or create an
-inbound rule in an Administrator PowerShell. Replace the example peer IP and
-path with yours:
-
-```powershell
-New-NetFirewallRule -DisplayName 'pair LAN' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 47321 -Profile Private -RemoteAddress 192.168.1.21 -Program 'C:\path\to\pair.exe'
-```
-
-On Ubuntu with UFW enabled, replace the peer IP:
-
-```sh
-sudo ufw allow from 192.168.1.21 to any port 47321 proto tcp
-```
-
-Connection refused usually means the host is stopped or the port is wrong.
-Timeouts suggest a wrong IP, firewall, or isolated Wi-Fi. Address-in-use means
-another listener has that port. Pairing/TLS errors require checking the complete
-current host code through your trusted channel. A second client is refused while
-one is connected. Click **Stop** before changing fields. Never disable TLS
-verification as a connectivity fix.
-
-## Implementation and tests
-
-One UI thread and one network thread running a current-thread Tokio runtime.
-The GUI sleeps in the native event loop; network notifications wake it, and
-editing schedules a one-shot debounce timer. No render loop or idle note polling.
-The worker uses persistent TLS sockets, bounded command/read channels, and a
-single latest-state notification slot. Only one local edit is in flight; later
-keystrokes wait for its host receipt.
-
-Frames are a four-byte big-endian length plus tagged UTF-8 JSON. Notes are limited
-to **256 KiB of UTF-8**, frames to **1,576,960 bytes** (allowing JSON escaping),
-and pre-authentication messages to 512 bytes. NUL is explicitly rejected because
-the native widget uses C strings. Malformed, oversized, truncated, and unexpected
-messages close the connection without echoing their content into errors.
-The dedicated reader retains partial-read state across UI activity. Handshake
-and write operations have five-second deadlines, heartbeats run every five
-seconds, and an unresponsive reader closes after 20 seconds. Unauthenticated
-handshakes do not block local host edits; at most one is pending.
-
-From a configured build shell:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
-cargo build --locked --release
-```
-
-For a headless machine without GUI development libraries, test the protocol,
-editor model, authority, and real TLS loopback transport separately:
-
-```sh
-cargo test --locked --no-default-features
-cargo clippy --locked --no-default-features --all-targets -- -D warnings
-```
-
-See [VALIDATION.md](VALIDATION.md) for actual results and platform limitations.
+Pair is written in Rust with a statically linked FLTK interface. Source builds
+require Rust 1.88+, a C++ compiler, CMake 3.28+, and the platform prerequisites
+listed in the build guide. Downloaded release binaries do not require Rust or a
+compiler.

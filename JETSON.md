@@ -1,11 +1,11 @@
-# Run pair on an original Jetson Nano
+# Run Pair on an original Jetson Nano
 
-This ARM64 build is produced in an Ubuntu 18.04 container for the JetPack 4
-userspace generation. It has not yet been run on physical Jetson hardware.
+This ARM64 build targets the Ubuntu 18.04 / JetPack 4 userspace generation. Pair
+has been user-confirmed on a physical Jetson Nano, although the exact JetPack
+version was not recorded. The v0.2 discovery and phrase-pairing flow still needs
+a fresh Jetson hardware check.
 
-No installation or administrator password is required. From the Jetson's
-graphical desktop, download `pair-linux-arm64-jetpack4.tar.gz`, then open a
-terminal and run:
+No installation or administrator password is required:
 
 ```sh
 cd ~/Downloads
@@ -14,18 +14,9 @@ chmod +x pair
 ./pair
 ```
 
-If the browser saved the file elsewhere, change `~/Downloads` accordingly. The
-window requires the Jetson's graphical X11 desktop. It will not open from a
-headless console without a display session.
+Run Pair from the graphical desktop. Choose **Connect**, select the nearby
+Windows host, and compare the six-word phrase on both screens. If discovery is
+blocked, enter the Windows laptop's LAN IPv4 address and port `47321` manually.
 
-Choose **Connect**, enter the Windows laptop's local IPv4 address, leave port
-`47321`, paste the pairing code shown by the Windows host, and click **Connect**.
-
-If the program reports a missing shared library, compare it with
-`LINKED-LIBRARIES.txt` and open an issue with the exact error plus:
-
-```sh
-cat /etc/nv_tegra_release
-lsb_release -ds
-ldd ./pair
-```
+For missing-library errors, compare `ldd ./pair` with
+`LINKED-LIBRARIES.txt`. See [connection help](docs/TROUBLESHOOTING.md).
