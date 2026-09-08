@@ -16,13 +16,14 @@ use crate::{
 
 pub const SERVICE_TYPE: &str = "_pair._tcp.local.";
 pub const MAX_DISCOVERED: usize = 32;
+pub const MAX_ADDRESSES_PER_DEVICE: usize = 8;
 const STALE_AFTER: Duration = Duration::from_secs(120);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DiscoveredDevice {
     pub id: String,
     pub name: String,
-    pub address: SocketAddr,
+    pub addresses: Vec<SocketAddr>,
 }
 
 struct Entry {
@@ -48,7 +49,7 @@ impl DiscoveryCatalog {
         if version != VERSION
             || !valid_id(id)
             || !valid_name(name)
-            || !address.ip().is_ipv4()
+            || !valid_address(address)
             || address.port() == 0
         {
             return false;
@@ -56,17 +57,30 @@ impl DiscoveryCatalog {
         if !self.entries.contains_key(&fullname) && self.entries.len() >= MAX_DISCOVERED {
             return false;
         }
-        self.entries.insert(
-            fullname,
-            Entry {
-                device: DiscoveredDevice {
-                    id: id.into(),
-                    name: name.into(),
-                    address,
+        if let Some(entry) = self.entries.get_mut(&fullname) {
+            if entry.device.id != id {
+                return false;
+            }
+            entry.device.name = name.into();
+            entry.seen = now;
+            if !entry.device.addresses.contains(&address)
+                && entry.device.addresses.len() < MAX_ADDRESSES_PER_DEVICE
+            {
+                entry.device.addresses.push(address);
+            }
+        } else {
+            self.entries.insert(
+                fullname,
+                Entry {
+                    device: DiscoveredDevice {
+                        id: id.into(),
+                        name: name.into(),
+                        addresses: vec![address],
+                    },
+                    seen: now,
                 },
-                seen: now,
-            },
-        );
+            );
+        }
         true
     }
 
@@ -82,32 +96,52 @@ impl DiscoveryCatalog {
     }
 
     pub fn devices(&self) -> Vec<DiscoveredDevice> {
-        let mut by_id = BTreeMap::new();
+        let mut by_id: BTreeMap<String, DiscoveredDevice> = BTreeMap::new();
         for entry in self.entries.values() {
-            by_id.insert(entry.device.id.clone(), entry.device.clone());
+            let merged = by_id
+                .entry(entry.device.id.clone())
+                .or_insert_with(|| DiscoveredDevice {
+                    id: entry.device.id.clone(),
+                    name: entry.device.name.clone(),
+                    addresses: Vec::new(),
+                });
+            merged.name = entry.device.name.clone();
+            for address in &entry.device.addresses {
+                if !merged.addresses.contains(address)
+                    && merged.addresses.len() < MAX_ADDRESSES_PER_DEVICE
+                {
+                    merged.addresses.push(*address);
+                }
+            }
         }
         by_id.into_values().collect()
     }
+}
+
+fn valid_address(address: SocketAddr) -> bool {
+    address.port() != 0
+        && address.ip().is_ipv4()
+        && !address.ip().is_loopback()
+        && !address.ip().is_unspecified()
+        && !address.ip().is_multicast()
 }
 
 fn valid_id(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn resolved_fields(service: &ResolvedService) -> Option<(&str, &str, SocketAddr, u32)> {
+fn resolved_fields(service: &ResolvedService) -> Option<(&str, &str, Vec<SocketAddr>, u32)> {
     let id = service.get_property_val_str("id")?;
     let name = service.get_property_val_str("name")?;
     let version = service.get_property_val_str("ver")?.parse().ok()?;
-    let ip = service
+    let addresses = service
         .get_addresses_v4()
         .into_iter()
-        .find(|ip| !ip.is_loopback())?;
-    Some((
-        id,
-        name,
-        SocketAddr::new(IpAddr::V4(ip), service.get_port()),
-        version,
-    ))
+        .map(|ip| SocketAddr::new(IpAddr::V4(ip), service.get_port()))
+        .filter(|address| valid_address(*address))
+        .take(MAX_ADDRESSES_PER_DEVICE)
+        .collect::<Vec<_>>();
+    (!addresses.is_empty()).then_some((id, name, addresses, version))
 }
 
 pub struct DiscoveryBrowser {
@@ -134,15 +168,19 @@ impl DiscoveryBrowser {
                 loop {
                     let changed = match events.recv_timeout(Duration::from_secs(2)) {
                         Ok(ServiceEvent::ServiceResolved(service)) => resolved_fields(&service)
-                            .is_some_and(|(id, name, address, version)| {
-                                catalog.resolve(
-                                    service.fullname.clone(),
-                                    id,
-                                    name,
-                                    address,
-                                    version,
-                                    Instant::now(),
-                                )
+                            .is_some_and(|(id, name, addresses, version)| {
+                                let mut changed = false;
+                                for address in addresses {
+                                    changed |= catalog.resolve(
+                                        service.fullname.clone(),
+                                        id,
+                                        name,
+                                        address,
+                                        version,
+                                        Instant::now(),
+                                    );
+                                }
+                                changed
                             }),
                         Ok(ServiceEvent::ServiceRemoved(_, fullname)) => catalog.remove(&fullname),
                         Ok(ServiceEvent::SearchStopped(_)) => break,
