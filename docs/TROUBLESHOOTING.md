@@ -50,10 +50,17 @@ release archive:
 
 ```sh
 cd ~/Downloads
-tar -xzf pair-linux-arm64-jetpack4.tar.gz
-chmod +x pair
-./pair
+mkdir -p pair-v0.2.0
+tar -xzf pair-linux-arm64-jetpack4.tar.gz -C pair-v0.2.0
+cd pair-v0.2.0
+sh install-desktop.sh
 ```
+
+Open **Pair** from the Jetson Applications menu after installation. The
+installer copies the executable to `~/.local/bin/pair` and creates
+`~/.local/share/applications/pair.desktop`; it changes only files owned by your
+user and does not use `sudo`. Run the installer from a newer extracted release
+to update the installed application.
 
 Run it inside the graphical desktop with a valid `DISPLAY`. A bare SSH session
 cannot show the X11 interface. Check missing runtime libraries with:

@@ -52,7 +52,7 @@ jobs:
       - name: Build in the JetPack 4 userspace generation
         run: docker run --rm --volume "$GITHUB_WORKSPACE:/work" --workdir /work ubuntu:18.04 bash ci/build-jetson.sh
       - name: Package
-        run: tar -czf dist/pair-linux-arm64-jetpack4.tar.gz -C dist/jetson pair JETSON.md LINKED-LIBRARIES.txt
+        run: tar -czf dist/pair-linux-arm64-jetpack4.tar.gz -C dist/jetson pair install-desktop.sh JETSON.md LINKED-LIBRARIES.txt
       - uses: actions/upload-artifact@v4
         with:
           name: pair-linux-arm64-jetpack4

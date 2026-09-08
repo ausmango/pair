@@ -25,5 +25,7 @@ cargo build --release --locked
 
 mkdir -p dist/linux-x64/package
 cp target/release/pair README.md LICENSE dist/linux-x64/package/
+cp scripts/install-linux-desktop.sh dist/linux-x64/package/install-desktop.sh
+chmod 0755 dist/linux-x64/package/install-desktop.sh
 tar -czf dist/pair-linux-x64.tar.gz -C dist/linux-x64/package .
 chmod -R a+rwX dist

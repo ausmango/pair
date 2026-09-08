@@ -24,6 +24,10 @@ Verify a download against `SHA256SUMS` when possible. Windows and macOS builds
 are currently unsigned. macOS builds are produced in CI but have not yet been
 tested on physical Macs.
 
+On Linux or Jetson, extract the archive and run `sh install-desktop.sh` once.
+This installs Pair for your current user with no administrator password, then
+you can open it from the Applications menu.
+
 ## Use Pair
 
 1. Open Pair on both computers. Give each one a useful device name.

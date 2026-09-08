@@ -33,5 +33,7 @@ CARGO_BUILD_JOBS=2 cargo build --release --locked
 mkdir -p dist/jetson
 cp target/release/pair dist/jetson/pair
 cp JETSON.md dist/jetson/JETSON.md
+cp scripts/install-linux-desktop.sh dist/jetson/install-desktop.sh
+chmod 0755 dist/jetson/install-desktop.sh
 ldd dist/jetson/pair | tee dist/jetson/LINKED-LIBRARIES.txt
 chmod -R a+rwX dist
