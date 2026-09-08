@@ -27,7 +27,9 @@ use pair::{
     state::Side,
 };
 
-const DEBOUNCE: Duration = Duration::from_millis(75);
+// Keep a short pause so fast typing is coalesced into one edit while making
+// the remote note feel immediate on a local network.
+const DEBOUNCE: Duration = Duration::from_millis(20);
 
 enum Action {
     StartStop,

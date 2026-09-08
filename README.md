@@ -4,7 +4,7 @@
 
 Pair is a tiny native notepad shared between two computers on the same local
 network. Paste a command, script, or any plain text on one computer and it
-appears on the other in about 75 ms.
+starts syncing after about 20 ms of idle typing, plus normal LAN latency.
 
 Pair never executes received text. It has no browser, cloud service, account,
 database, clipboard monitoring, telemetry, or note logging.
