@@ -22,9 +22,9 @@ jobs:
           rustup toolchain install 1.88.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
           rustup default 1.88.0-x86_64-pc-windows-msvc
           cargo fmt --all -- --check
-          cargo clippy --all-targets --locked --features fltk/fltk-bundled -- -D warnings
-          cargo test --all-targets --locked --features fltk/fltk-bundled
-          cargo build --release --locked --features fltk/fltk-bundled
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          cargo build --release --locked
       - name: Package
         shell: pwsh
         run: |
@@ -92,7 +92,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>dev.pair.notepad</string>
             <key>CFBundleName</key><string>Pair</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.2.2</string>
+            <key>CFBundleShortVersionString</key><string>0.2.3</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
           </dict></plist>
           PLIST
