@@ -1,6 +1,6 @@
 [package]
 name = "pair"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.88"
 description = "A small, encrypted LAN notepad for two computers"

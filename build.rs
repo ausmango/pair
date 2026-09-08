@@ -19,14 +19,14 @@ fn main() {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let resource = if target_env == "msvc" {
         let resource = out.join("pair.res");
-        let status = Command::new("rc.exe")
-            .arg("/nologo")
-            .arg("/fo")
+        let status = Command::new("llvm-rc.exe")
+            .arg("/FO")
             .arg(&resource)
+            .arg("--")
             .arg(&rc)
             .status()
-            .expect("run rc.exe");
-        assert!(status.success(), "rc.exe failed");
+            .expect("run llvm-rc.exe");
+        assert!(status.success(), "llvm-rc.exe failed");
         resource
     } else {
         let resource = out.join("pair-icon.o");
