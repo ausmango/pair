@@ -1,4 +1,6 @@
-# pair
+<p align="center">
+  <img src="assets/pair-horizontal.svg" alt="pair" width="520">
+</p>
 
 Pair is a tiny native notepad shared between two computers on the same local
 network. Paste a command, script, or any plain text on one computer and it
