@@ -1,6 +1,6 @@
 [package]
 name = "pair"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
 description = "A small, encrypted LAN notepad for two computers"
@@ -11,7 +11,7 @@ default = ["gui"]
 gui = ["dep:fltk"]
 
 [dependencies]
-fltk = { version = "=1.5.23", optional = true, default-features = false, features = ["no-images", "use-ninja", "static-msvcrt"] }
+fltk = { version = "=1.5.23", optional = true, default-features = false, features = ["no-images", "use-ninja"] }
 flume = { version = "0.11", default-features = false }
 mdns-sd = { version = "0.17", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
