@@ -1,4 +1,10 @@
-use std::{io, net::SocketAddr, sync::Arc, thread, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncWrite, WriteHalf},
@@ -11,8 +17,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::{
     discovery::Advertiser,
-    persistence::{DeviceIdentity, Store},
-    protocol::{MAX_FRAME_BYTES, MAX_PAIRING_BYTES, Message, VERSION, read_frame, write_frame},
+    persistence::{DeviceIdentity, MAX_TRUSTED_PEERS, Store},
+    protocol::{
+        MAX_FRAME_BYTES, MAX_PAIRING_BYTES, Message, PairingError, VERSION, read_frame, write_frame,
+    },
     state::{Authority, Edit, Side, Snapshot},
     tls::{
         Identity, Pairing, certificate_fingerprint, client_config, hex, provisional_client_config,
@@ -24,13 +32,62 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
+const CONNECT_BUDGET: Duration = Duration::from_secs(3);
+const ADDRESS_ATTEMPT: Duration = Duration::from_millis(750);
+const MAX_ADDRESSES: usize = 8;
 
 #[derive(Clone)]
 pub struct ConnectTarget {
-    pub address: SocketAddr,
+    pub addresses: Vec<SocketAddr>,
     pub id: Option<String>,
     pub name: Option<String>,
     pub pairing: Option<Pairing>,
+}
+
+pub fn ordered_addresses(
+    last_successful: Option<SocketAddr>,
+    discovered: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut addresses = Vec::new();
+    if let Some(address) = last_successful {
+        addresses.push(address);
+    }
+    let mut routed = Vec::new();
+    let mut link_local = Vec::new();
+    for address in discovered {
+        if matches!(address.ip(), IpAddr::V4(ip) if ip.is_link_local()) {
+            link_local.push(address);
+        } else {
+            routed.push(address);
+        }
+    }
+    addresses.extend(routed);
+    addresses.extend(link_local);
+    normalize_addresses(&mut addresses);
+    addresses
+}
+
+fn normalize_addresses(addresses: &mut Vec<SocketAddr>) {
+    let mut unique = Vec::new();
+    for address in addresses.drain(..) {
+        if address.port() != 0
+            && !address.ip().is_multicast()
+            && !address.ip().is_unspecified()
+            && !unique.contains(&address)
+        {
+            unique.push(address);
+            if unique.len() == MAX_ADDRESSES {
+                break;
+            }
+        }
+    }
+    *addresses = unique;
+}
+
+fn prioritize_address(addresses: &mut Vec<SocketAddr>, address: SocketAddr) {
+    addresses.retain(|candidate| *candidate != address);
+    addresses.insert(0, address);
+    addresses.truncate(MAX_ADDRESSES);
 }
 
 pub enum Mode {
@@ -50,6 +107,7 @@ pub enum Command {
     TakeControl,
     ConfirmPairing,
     RejectPairing,
+    UpdateAddresses(Vec<SocketAddr>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -258,6 +316,58 @@ async fn connect_provisional(
     .map_err(|_| "Connection timed out. Check the host, port, and firewall.".to_string())?
 }
 
+pub async fn connect_authenticated_first(
+    addresses: &[SocketAddr],
+    pairing: &Pairing,
+) -> Result<(TlsStream<TcpStream>, SocketAddr), String> {
+    let started = time::Instant::now();
+    let mut last_error = "Device found but unreachable.".to_string();
+    for &address in addresses {
+        let remaining = CONNECT_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(
+            ADDRESS_ATTEMPT.min(remaining),
+            connect_authenticated(address, pairing),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => return Ok((stream, address)),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => {
+                last_error =
+                    "Device found but unreachable. Check the firewall and network permission."
+                        .into()
+            }
+        }
+    }
+    Err(last_error)
+}
+
+async fn connect_provisional_candidates(
+    addresses: &[SocketAddr],
+) -> Result<(TlsStream<TcpStream>, [u8; 32], SocketAddr), String> {
+    let started = time::Instant::now();
+    let mut last_error = "Device found but unreachable.".to_string();
+    for &address in addresses {
+        let remaining = CONNECT_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(ADDRESS_ATTEMPT.min(remaining), connect_provisional(address)).await {
+            Ok(Ok((stream, fingerprint))) => return Ok((stream, fingerprint, address)),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => {
+                last_error =
+                    "Device found but unreachable. Check the firewall and network permission."
+                        .into()
+            }
+        }
+    }
+    Err(last_error)
+}
+
 struct Reader {
     rx: mpsc::Receiver<Result<Message, String>>,
     task: JoinHandle<()>,
@@ -292,7 +402,7 @@ fn local_command(authority: &mut Authority, command: Command) {
             authority.edit(Side::Host, edit);
         }
         Command::TakeControl => authority.take_control(Side::Host),
-        Command::ConfirmPairing | Command::RejectPairing => {}
+        Command::ConfirmPairing | Command::RejectPairing | Command::UpdateAddresses(_) => {}
     }
 }
 
@@ -317,7 +427,7 @@ enum Incoming {
 async fn accept_incoming(
     socket: TcpStream,
     identity: &Identity,
-    paired: bool,
+    store: &Store,
 ) -> Result<Incoming, String> {
     let mut stream = accept_tls(socket, identity).await?;
     let message = timeout(IO_TIMEOUT, read_frame(&mut stream, MAX_PAIRING_BYTES))
@@ -326,7 +436,7 @@ async fn accept_incoming(
         .map_err(io_message)?;
     match message {
         Message::Hello { version, token }
-            if paired && version == VERSION && identity.pairing.authenticates(&token) =>
+            if version == VERSION && store.token_authenticates(&token) =>
         {
             Ok(Incoming::Authenticated(stream))
         }
@@ -334,13 +444,29 @@ async fn accept_incoming(
             version,
             device_id,
             device_name,
-        } if !paired && version == VERSION => Ok(Incoming::Pairing(
-            stream,
-            DeviceIdentity {
-                id: device_id,
-                name: device_name,
-            },
-        )),
+        } if version == VERSION => {
+            let repairing = store
+                .trusted_peers()
+                .iter()
+                .any(|peer| peer.id == device_id);
+            if store.trusted_peers().len() >= MAX_TRUSTED_PEERS && !repairing {
+                let _ = send(
+                    &mut stream,
+                    &Message::PairRejected {
+                        reason: PairingError::TrustListFull,
+                    },
+                )
+                .await;
+                return Err("Host trust list full. Remove a paired device.".into());
+            }
+            Ok(Incoming::Pairing(
+                stream,
+                DeviceIdentity {
+                    id: device_id,
+                    name: device_name,
+                },
+            ))
+        }
         Message::Hello { version, .. } | Message::PairRequest { version, .. }
             if version != VERSION =>
         {
@@ -348,10 +474,6 @@ async fn accept_incoming(
             Err(format!(
                 "Application version mismatch; this host uses protocol {VERSION}."
             ))
-        }
-        Message::PairRequest { .. } => {
-            let _ = send(&mut stream, &Message::PairRejected {}).await;
-            Err("Pairing rejected. Forget the saved peer first, or update both devices.".into())
         }
         _ => {
             let _ = send(&mut stream, &Message::AuthFailed {}).await;
@@ -388,7 +510,7 @@ async fn run_host(
     publisher: &mut Publisher,
 ) -> Result<(), String> {
     let mut authority = Authority::new(text).map_err(str::to_string)?;
-    let mut identity = store.identity()?;
+    let identity = store.identity()?;
     let listener = TcpListener::bind(address).await.map_err(io_message)?;
     let bound = listener.local_addr().map_err(io_message)?;
     publisher.view.bound_address = Some(bound);
@@ -414,7 +536,7 @@ async fn run_host(
             }
         };
         drop(advertiser);
-        match accept_incoming(accepted.0, &identity, store.has_trusted_peer()).await {
+        match accept_incoming(accepted.0, &identity, &store).await {
             Ok(Incoming::Authenticated(stream)) => {
                 authority.connection_changed();
                 publisher.view.connected = true;
@@ -437,7 +559,7 @@ async fn run_host(
                         stream,
                         peer,
                         &store,
-                        &mut identity,
+                        &identity,
                         commands,
                         &mut authority,
                         publisher,
@@ -464,7 +586,7 @@ async fn host_pair_session(
     stream: TlsStream<TcpStream>,
     peer: DeviceIdentity,
     store: &Store,
-    identity: &mut Identity,
+    identity: &Identity,
     commands: &mut mpsc::Receiver<Command>,
     authority: &mut Authority,
     publisher: &mut Publisher,
@@ -494,22 +616,27 @@ async fn host_pair_session(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::ConfirmPairing) if !prompt.local_confirmed => { prompt.local_confirmed = true; send(&mut writer, &Message::PairConfirm {}).await?; publisher.prompt(Some(prompt.clone())); }
-                Some(Command::RejectPairing) => { let _ = send(&mut writer, &Message::PairRejected {}).await; return Err("Pairing rejected locally.".into()); }
+                Some(Command::RejectPairing) => { let _ = send(&mut writer, &Message::PairRejected { reason: PairingError::Rejected }).await; return Err("Pairing rejected locally.".into()); }
                 Some(command) => { local_command(authority, command); publisher.state(authority); }
                 None => return Ok(()),
             },
             message = reader.rx.recv() => match message.ok_or("Pairing connection closed.")?? {
                 Message::PairConfirm {} => { prompt.peer_confirmed = true; publisher.prompt(Some(prompt.clone())); }
-                Message::PairRejected {} => return Err("The other computer rejected pairing.".into()),
+                Message::PairRejected { .. } => return Err("The other computer rejected pairing.".into()),
                 _ => return Err("Unexpected message during pairing.".into()),
             }
         }
         if prompt.local_confirmed && prompt.peer_confirmed {
             let token = random_bytes::<32>().map_err(str::to_string)?;
-            store.trust_peer(peer.clone(), token)?;
-            identity.set_token(token);
             send(&mut writer, &Message::PairGranted { token: hex(&token) }).await?;
-            return Ok(());
+            match timeout(IO_TIMEOUT, reader.rx.recv()).await {
+                Ok(Some(Ok(Message::PairStored {}))) => {
+                    store.trust_peer(peer.clone(), token)?;
+                    send(&mut writer, &Message::PairComplete {}).await?;
+                    return Ok(());
+                }
+                _ => return Err("Pairing was interrupted before the client saved it.".into()),
+            }
         }
     }
 }
@@ -520,10 +647,17 @@ async fn run_client(
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
 ) -> Result<(), String> {
+    normalize_addresses(&mut target.addresses);
+    if target.addresses.is_empty() {
+        return Err(
+            "Device not discovered. Open Connection help or enter an address under Advanced."
+                .into(),
+        );
+    }
     if target.pairing.is_none() {
-        publisher.view.status = format!("Starting unverified pairing with {}...", target.address);
+        publisher.view.status = "Starting unverified pairing...".into();
         publisher.publish();
-        let (pairing, id, name) = timeout(
+        let (pairing, id, name, address) = timeout(
             PAIR_TIMEOUT,
             client_pair_session(&target, &store, commands, publisher),
         )
@@ -532,31 +666,74 @@ async fn run_client(
         target.pairing = Some(pairing);
         target.id = Some(id);
         target.name = Some(name);
+        prioritize_address(&mut target.addresses, address);
         publisher.prompt(None);
     }
-    let pairing = target
+    let mut pairing = target
         .pairing
         .as_ref()
         .expect("pairing established")
         .clone();
-    let mut delay = 1;
+    let delays = [250, 500, 1_000, 2_000, 5_000];
+    let mut retry = 0usize;
     loop {
-        publisher.view.status = format!("Connecting securely to {}...", target.address);
+        publisher.view.status = "Connecting securely...".into();
         publisher.publish();
-        let result = match connect_authenticated(target.address, &pairing).await {
-            Ok(stream) => client_session(stream, commands, publisher, &mut delay).await,
+        let result = match connect_authenticated_first(&target.addresses, &pairing).await {
+            Ok((stream, address)) => {
+                store.update_host_address(address)?;
+                prioritize_address(&mut target.addresses, address);
+                retry = 0;
+                client_session(stream, commands, publisher).await
+            }
             Err(error) => Err(error),
         };
         publisher.view.connected = false;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.contains("Authentication rejected"))
+        {
+            publisher.view.status =
+                "Pairing required or needs repair. Compare a new phrase.".into();
+            publisher.publish();
+            let (new_pairing, id, name, address) = timeout(
+                PAIR_TIMEOUT,
+                client_pair_session(&target, &store, commands, publisher),
+            )
+            .await
+            .map_err(|_| "Repair pairing expired after 60 seconds.".to_string())??;
+            pairing = new_pairing;
+            target.id = Some(id);
+            target.name = Some(name);
+            prioritize_address(&mut target.addresses, address);
+            publisher.prompt(None);
+            retry = 0;
+            continue;
+        }
+        let delay = delays[retry.min(delays.len() - 1)];
         publisher.view.status = format!(
-            "{} Retrying in {delay}s. Stop to change details.",
+            "{} Retrying shortly. Open Connection help if this continues.",
             result.err().unwrap_or_else(|| "Disconnected.".into())
         );
         publisher.publish();
-        while commands.try_recv().is_ok() {}
-        time::sleep(Duration::from_secs(delay)).await;
-        while commands.try_recv().is_ok() {}
-        delay = (delay * 2).min(5);
+        let sleep = time::sleep(Duration::from_millis(delay));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                command = commands.recv() => match command {
+                    Some(Command::UpdateAddresses(addresses)) => {
+                        for address in addresses { if !target.addresses.contains(&address) { target.addresses.push(address); } }
+                        normalize_addresses(&mut target.addresses);
+                        retry = 0;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return Ok(()),
+                }
+            }
+        }
+        retry = (retry + 1).min(delays.len() - 1);
     }
 }
 
@@ -565,8 +742,9 @@ async fn client_pair_session(
     store: &Store,
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
-) -> Result<(Pairing, String, String), String> {
-    let (mut stream, fingerprint) = connect_provisional(target.address).await?;
+) -> Result<(Pairing, String, String, SocketAddr), String> {
+    let (mut stream, fingerprint, address) =
+        connect_provisional_candidates(&target.addresses).await?;
     let device = store.device();
     send(
         &mut stream,
@@ -613,7 +791,7 @@ async fn client_pair_session(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::ConfirmPairing) if !prompt.local_confirmed => { prompt.local_confirmed = true; send(&mut writer, &Message::PairConfirm {}).await?; publisher.prompt(Some(prompt.clone())); }
-                Some(Command::RejectPairing) => { let _ = send(&mut writer, &Message::PairRejected {}).await; return Err("Pairing rejected locally.".into()); }
+                Some(Command::RejectPairing) => { let _ = send(&mut writer, &Message::PairRejected { reason: PairingError::Rejected }).await; return Err("Pairing rejected locally.".into()); }
                 Some(_) => {}
                 None => return Err("Pairing stopped.".into()),
             },
@@ -621,10 +799,16 @@ async fn client_pair_session(
                 Message::PairConfirm {} => { prompt.peer_confirmed = true; publisher.prompt(Some(prompt.clone())); }
                 Message::PairGranted { token } if prompt.local_confirmed && prompt.peer_confirmed => {
                     let pairing = Pairing::parse(&format!("pair1:{}:{token}", hex(&fingerprint))).map_err(str::to_string)?;
-                    store.trust_host(host_id.clone(), host_name.clone(), target.address, pairing.clone())?;
-                    return Ok((pairing, host_id, host_name));
+                    store.trust_host(host_id.clone(), host_name.clone(), address, pairing.clone())?;
+                    send(&mut writer, &Message::PairStored {}).await?;
+                    match reader.rx.recv().await {
+                        Some(Ok(Message::PairComplete {})) => return Ok((pairing, host_id, host_name, address)),
+                        _ => return Err("Pairing needs repair. Select this host and compare the phrase again.".into()),
+                    }
                 }
-                Message::PairRejected {} => return Err("The host rejected pairing.".into()),
+                Message::PairRejected { reason: PairingError::TrustListFull } => return Err("Host trust list full. Remove a paired device on the host.".into()),
+                Message::PairRejected { reason: PairingError::NeedsRepair } => return Err("Pairing required or needs repair.".into()),
+                Message::PairRejected { .. } => return Err("The host rejected pairing.".into()),
                 _ => return Err("Unexpected message during pairing.".into()),
             }
         }
@@ -665,7 +849,6 @@ async fn client_session(
     mut stream: TlsStream<TcpStream>,
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
-    delay: &mut u64,
 ) -> Result<(), String> {
     let first = timeout(IO_TIMEOUT, read_frame(&mut stream, MAX_FRAME_BYTES))
         .await
@@ -690,7 +873,6 @@ async fn client_session(
     publisher.view.connected = true;
     publisher.view.status = "Connected to host (TLS 1.3, pinned certificate).".into();
     publisher.publish();
-    *delay = 1;
     let (mut reader, mut writer) = split(stream);
     let mut heartbeat = time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);

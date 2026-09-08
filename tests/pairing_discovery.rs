@@ -8,7 +8,7 @@ use std::{
 use pair::{
     discovery::{DiscoveryCatalog, MAX_DISCOVERED},
     persistence::{DeviceIdentity, Store, valid_name},
-    tls::{Identity, safety_phrase},
+    tls::{Identity, hex, safety_phrase},
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -21,6 +21,36 @@ fn location(label: &str) -> (PathBuf, PathBuf) {
     ));
     let _ = std::fs::remove_dir_all(&directory);
     (directory.join("state.json"), directory)
+}
+
+#[test]
+fn version_one_settings_migrate_without_changing_identity_or_pairing() {
+    let (path, directory) = location("migration");
+    std::fs::create_dir_all(&directory).unwrap();
+    let identity = Identity::generate().unwrap();
+    let fingerprint = identity.pairing.fingerprint;
+    let token = identity.pairing.token();
+    let old = serde_json::json!({
+        "version": 1,
+        "device_id": "aa".repeat(16),
+        "device_name": "Old Pair",
+        "certificate": hex(identity.cert_der()),
+        "private_key": hex(identity.key_der()),
+        "host_token": token,
+        "trusted_peer": { "id": "bb".repeat(16), "name": "Laptop" },
+        "trusted_host": null
+    });
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let store = Store::load(path.clone()).unwrap();
+    assert_eq!(store.identity().unwrap().pairing.fingerprint, fingerprint);
+    assert!(store.token_authenticates(&identity.pairing.token()));
+    assert_eq!(store.trusted_peers()[0].name, "Laptop");
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"version\":2")
+    );
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -81,12 +111,35 @@ fn forgetting_revokes_tokens_and_corrupt_settings_fail_closed() {
         )
         .unwrap();
     let old = store.identity().unwrap().pairing;
-    store.forget_peer().unwrap();
+    store.forget_peer(&"56".repeat(16)).unwrap();
     let new = store.identity().unwrap().pairing;
     assert!(!new.authenticates(&old.token()));
     assert!(!store.has_trusted_peer());
     std::fs::write(&path, b"{broken").unwrap();
     assert!(Store::load(path).is_err());
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn two_peers_authenticate_and_removal_is_individual() {
+    let (path, directory) = location("multiple-peers");
+    let store = Store::load(path).unwrap();
+    let first = DeviceIdentity {
+        id: "10".repeat(16),
+        name: "Laptop".into(),
+    };
+    let second = DeviceIdentity {
+        id: "20".repeat(16),
+        name: "Jetson".into(),
+    };
+    store.trust_peer(first.clone(), [1; 32]).unwrap();
+    store.trust_peer(second.clone(), [2; 32]).unwrap();
+    assert!(store.token_authenticates(&"01".repeat(32)));
+    assert!(store.token_authenticates(&"02".repeat(32)));
+    store.forget_peer(&first.id).unwrap();
+    assert!(!store.token_authenticates(&"01".repeat(32)));
+    assert!(store.token_authenticates(&"02".repeat(32)));
+    assert_eq!(store.trusted_peers().len(), 1);
     let _ = std::fs::remove_dir_all(directory);
 }
 
@@ -140,7 +193,7 @@ fn discovery_filters_limits_deduplicates_and_expires_entries() {
             &id,
             "Pair host",
             address,
-            2,
+            3,
             now
         ));
     }
@@ -150,7 +203,7 @@ fn discovery_filters_limits_deduplicates_and_expires_entries() {
         &"ff".repeat(16),
         "Extra",
         "192.168.2.2:47321".parse().unwrap(),
-        2,
+        3,
         now
     ));
     assert!(!catalog.resolve(
@@ -158,11 +211,45 @@ fn discovery_filters_limits_deduplicates_and_expires_entries() {
         &"ee".repeat(16),
         "Old",
         "192.168.2.3:47321".parse().unwrap(),
-        1,
+        2,
         now
     ));
     assert!(catalog.prune(now + Duration::from_secs(121)));
     assert!(catalog.devices().is_empty());
+}
+
+#[test]
+fn discovery_merges_routed_and_direct_ethernet_addresses() {
+    let mut catalog = DiscoveryCatalog::default();
+    let now = Instant::now();
+    let id = "ab".repeat(16);
+    assert!(catalog.resolve(
+        "one".into(),
+        &id,
+        "Jetson",
+        "192.168.1.8:47321".parse().unwrap(),
+        3,
+        now
+    ));
+    assert!(catalog.resolve(
+        "one".into(),
+        &id,
+        "Jetson",
+        "169.254.7.9:47321".parse().unwrap(),
+        3,
+        now
+    ));
+    assert!(!catalog.resolve(
+        "one".into(),
+        &id,
+        "Jetson",
+        "127.0.0.1:47321".parse().unwrap(),
+        3,
+        now
+    ));
+    let devices = catalog.devices();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].addresses.len(), 2);
 }
 
 #[test]

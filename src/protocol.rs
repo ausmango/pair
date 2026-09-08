@@ -5,12 +5,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::state::{Edit, Snapshot};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_NOTE_BYTES: usize = 256 * 1024;
 // JSON can escape each byte as six ASCII bytes (e.g. a control character).
 pub const MAX_FRAME_BYTES: usize = MAX_NOTE_BYTES * 6 + 4096;
 pub const MAX_HELLO_BYTES: usize = 512;
 pub const MAX_PAIRING_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingError {
+    Rejected,
+    TrustListFull,
+    NeedsRepair,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -36,7 +44,11 @@ pub enum Message {
     PairGranted {
         token: String,
     },
-    PairRejected {},
+    PairStored {},
+    PairComplete {},
+    PairRejected {
+        reason: PairingError,
+    },
     State {
         snapshot: Snapshot,
     },

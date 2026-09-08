@@ -7,11 +7,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::tls::{Identity, Pairing, hex, random_bytes, unhex};
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_NAME_BYTES: usize = 32;
+pub const MAX_TRUSTED_PEERS: usize = 8;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceIdentity {
@@ -27,11 +29,18 @@ pub struct TrustedHost {
     pub pairing: Pairing,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedPeer {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerRecord {
     id: String,
     name: String,
+    token: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -51,9 +60,28 @@ struct Data {
     device_name: String,
     certificate: String,
     private_key: String,
-    host_token: String,
-    trusted_peer: Option<PeerRecord>,
+    trusted_peers: Vec<PeerRecord>,
     trusted_host: Option<HostRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataV1 {
+    version: u32,
+    device_id: String,
+    device_name: String,
+    certificate: String,
+    private_key: String,
+    host_token: String,
+    trusted_peer: Option<PeerV1>,
+    trusted_host: Option<HostRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerV1 {
+    id: String,
+    name: String,
 }
 
 #[derive(Clone)]
@@ -83,8 +111,7 @@ impl Data {
             device_id,
             certificate: hex(identity.cert_der()),
             private_key: hex(identity.key_der()),
-            host_token: identity.pairing.token(),
-            trusted_peer: None,
+            trusted_peers: Vec::new(),
             trusted_host: None,
         })
     }
@@ -98,15 +125,19 @@ impl Data {
         }
         let cert = unhex(&self.certificate, 16 * 1024).map_err(str::to_string)?;
         let key = unhex(&self.private_key, 16 * 1024).map_err(str::to_string)?;
-        let token: [u8; 32] = unhex(&self.host_token, 32)
-            .map_err(str::to_string)?
-            .try_into()
-            .map_err(|_| "Stored host token has the wrong length.")?;
-        Identity::from_der(cert, key, token).map_err(str::to_string)?;
-        if let Some(peer) = &self.trusted_peer
-            && (!valid_id(&peer.id) || !valid_name(&peer.name))
-        {
-            return Err("Stored peer is invalid.".into());
+        Identity::from_der(cert, key, [0; 32]).map_err(str::to_string)?;
+        if self.trusted_peers.len() > MAX_TRUSTED_PEERS {
+            return Err("Too many stored peers.".into());
+        }
+        for (index, peer) in self.trusted_peers.iter().enumerate() {
+            if !valid_id(&peer.id)
+                || !valid_name(&peer.name)
+                || unhex(&peer.token, 32).is_err()
+                || peer.token.len() != 64
+                || self.trusted_peers[..index].iter().any(|p| p.id == peer.id)
+            {
+                return Err("Stored peer is invalid.".into());
+            }
         }
         if let Some(host) = &self.trusted_host
             && (!valid_id(&host.id)
@@ -120,6 +151,40 @@ impl Data {
     }
 }
 
+fn migrate_v1(bytes: &[u8]) -> Result<Data, String> {
+    let old: DataV1 =
+        serde_json::from_slice(bytes).map_err(|_| "Pair settings file is invalid.".to_string())?;
+    if old.version != 1 {
+        return Err("Unsupported Pair settings version.".into());
+    }
+    let trusted_peers = old
+        .trusted_peer
+        .map(|peer| PeerRecord {
+            id: peer.id,
+            name: peer.name,
+            token: old.host_token,
+        })
+        .into_iter()
+        .collect();
+    Ok(Data {
+        version: FORMAT_VERSION,
+        device_id: old.device_id,
+        device_name: old.device_name,
+        certificate: old.certificate,
+        private_key: old.private_key,
+        trusted_peers,
+        trusted_host: old.trusted_host,
+    })
+}
+
+fn version_on_disk(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("version")?
+        .as_u64()
+}
+
 impl Store {
     pub fn load_default() -> Result<Self, String> {
         Self::load(default_path()?)
@@ -131,8 +196,16 @@ impl Store {
             if bytes.len() > 128 * 1024 {
                 return Err("Pair settings file is too large.".into());
             }
-            serde_json::from_slice::<Data>(&bytes)
-                .map_err(|_| "Pair settings file is invalid.".to_string())?
+            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("version")?.as_u64())
+                .ok_or_else(|| "Pair settings file is invalid.".to_string())?;
+            match version {
+                1 => migrate_v1(&bytes)?,
+                2 => serde_json::from_slice::<Data>(&bytes)
+                    .map_err(|_| "Pair settings file is invalid.".to_string())?,
+                _ => return Err("Unsupported Pair settings version.".into()),
+            }
         } else {
             Data::generate()?
         };
@@ -141,7 +214,7 @@ impl Store {
             path,
             data: Arc::new(Mutex::new(data)),
         };
-        if !store.path.exists() {
+        if !store.path.exists() || version_on_disk(&store.path) == Some(1) {
             store.save()?;
         }
         Ok(store)
@@ -174,38 +247,74 @@ impl Store {
             .map_err(|_| "Pair settings are unavailable.")?;
         let cert = unhex(&data.certificate, 16 * 1024).map_err(str::to_string)?;
         let key = unhex(&data.private_key, 16 * 1024).map_err(str::to_string)?;
-        let token: [u8; 32] = unhex(&data.host_token, 32)
-            .map_err(str::to_string)?
-            .try_into()
-            .map_err(|_| "Stored host token has the wrong length.")?;
-        Identity::from_der(cert, key, token).map_err(str::to_string)
+        Identity::from_der(cert, key, [0; 32]).map_err(str::to_string)
     }
 
     pub fn has_trusted_peer(&self) -> bool {
         self.data
             .lock()
-            .is_ok_and(|data| data.trusted_peer.is_some())
+            .is_ok_and(|data| !data.trusted_peers.is_empty())
+    }
+
+    pub fn trusted_peers(&self) -> Vec<TrustedPeer> {
+        self.data.lock().map_or_else(
+            |_| Vec::new(),
+            |data| {
+                data.trusted_peers
+                    .iter()
+                    .map(|peer| TrustedPeer {
+                        id: peer.id.clone(),
+                        name: peer.name.clone(),
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    pub fn token_authenticates(&self, candidate: &str) -> bool {
+        let Ok(candidate): Result<[u8; 32], _> =
+            unhex(candidate, 32).and_then(|bytes| bytes.try_into().map_err(|_| "bad token"))
+        else {
+            return false;
+        };
+        self.data.lock().is_ok_and(|data| {
+            let mut matched = 0u8;
+            for peer in &data.trusted_peers {
+                if let Ok(token) =
+                    unhex(&peer.token, 32).and_then(|v| v.try_into().map_err(|_| "bad token"))
+                {
+                    matched |= u8::from(token.ct_eq(&candidate));
+                }
+            }
+            matched == 1
+        })
     }
 
     pub fn trust_peer(&self, peer: DeviceIdentity, token: [u8; 32]) -> Result<(), String> {
         if !valid_id(&peer.id) || !valid_name(&peer.name) {
             return Err("Peer identity is invalid.".into());
         }
+        if self.trusted_peers().len() >= MAX_TRUSTED_PEERS
+            && !self.trusted_peers().iter().any(|saved| saved.id == peer.id)
+        {
+            return Err("Host trust list full. Remove a paired device.".into());
+        }
         self.update(|data| {
-            data.host_token = hex(&token);
-            data.trusted_peer = Some(PeerRecord {
+            data.trusted_peers.retain(|saved| saved.id != peer.id);
+            data.trusted_peers.push(PeerRecord {
                 id: peer.id,
                 name: peer.name,
+                token: hex(&token),
             });
         })
     }
 
-    pub fn forget_peer(&self) -> Result<(), String> {
-        let token = random_bytes::<32>().map_err(str::to_string)?;
-        self.update(|data| {
-            data.host_token = hex(&token);
-            data.trusted_peer = None;
-        })
+    pub fn forget_peer(&self, id: &str) -> Result<(), String> {
+        self.update(|data| data.trusted_peers.retain(|peer| peer.id != id))
+    }
+
+    pub fn forget_all_peers(&self) -> Result<(), String> {
+        self.update(|data| data.trusted_peers.clear())
     }
 
     pub fn reset_host_identity(&self) -> Result<(), String> {
@@ -213,8 +322,7 @@ impl Store {
         self.update(|data| {
             data.certificate = hex(identity.cert_der());
             data.private_key = hex(identity.key_der());
-            data.host_token = identity.pairing.token();
-            data.trusted_peer = None;
+            data.trusted_peers.clear();
         })
     }
 
@@ -251,6 +359,14 @@ impl Store {
 
     pub fn forget_host(&self) -> Result<(), String> {
         self.update(|data| data.trusted_host = None)
+    }
+
+    pub fn update_host_address(&self, address: SocketAddr) -> Result<(), String> {
+        self.update(|data| {
+            if let Some(host) = &mut data.trusted_host {
+                host.address = address.to_string();
+            }
+        })
     }
 
     fn update(&self, change: impl FnOnce(&mut Data)) -> Result<(), String> {

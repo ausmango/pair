@@ -8,6 +8,7 @@ use pair::{
     editor::Editor,
     network::{
         Command, ConnectTarget, Mode, Network, View, accept_authenticated, connect_authenticated,
+        connect_authenticated_first,
     },
     persistence::{DeviceIdentity, Store},
     protocol::{MAX_FRAME_BYTES, Message, read_frame, write_frame},
@@ -97,7 +98,7 @@ async fn first_pairing_requires_both_confirmations_then_reconnects_with_saved_tr
     let mut client = Network::start(
         Mode::Connect {
             target: ConnectTarget {
-                address,
+                addresses: vec![address],
                 id: None,
                 name: None,
                 pairing: None,
@@ -154,7 +155,7 @@ async fn rejected_pairing_saves_no_trust_and_releases_no_note() {
     let mut client = Network::start(
         Mode::Connect {
             target: ConnectTarget {
-                address,
+                addresses: vec![address],
                 id: None,
                 name: None,
                 pairing: None,
@@ -279,6 +280,28 @@ async fn incorrect_fingerprint_and_token_release_no_note() {
 }
 
 #[tokio::test]
+async fn connection_falls_back_to_the_next_available_address() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_address = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let working_address = listener.local_addr().unwrap();
+    let identity = Identity::generate().unwrap();
+    let pairing = identity.pairing.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let _ = accept_authenticated(socket, &identity).await.unwrap();
+    });
+    let (stream, selected) =
+        connect_authenticated_first(&[unavailable_address, working_address], &pairing)
+            .await
+            .unwrap();
+    assert_eq!(selected, working_address);
+    drop(stream);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn reconnect_keeps_unsent_editor_text_as_a_draft() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -319,7 +342,7 @@ async fn reconnect_keeps_unsent_editor_text_as_a_draft() {
     let mut client = Network::start(
         Mode::Connect {
             target: ConnectTarget {
-                address,
+                addresses: vec![address],
                 id: None,
                 name: None,
                 pairing: Some(pairing),
