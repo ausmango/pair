@@ -6,6 +6,10 @@ Both computers must be on the same local network and multicast DNS must be
 allowed. Guest Wi-Fi, client isolation, VPNs, and some corporate networks block
 device-to-device traffic or multicast.
 
+Pair checks every IPv4 address advertised by a host, including Wi-Fi, normal
+Ethernet, and `169.254.x.x` link-local addresses used by a direct Ethernet
+cable. Leave both adapters enabled; Pair tries the last working address first.
+
 Use manual connection when discovery is unavailable:
 
 1. Start the host on `0.0.0.0` and port `47321`.
@@ -22,6 +26,11 @@ Allow Pair on private networks when Windows asks. Pair needs inbound TCP on its
 selected port and IPv4 multicast DNS on UDP 5353. Avoid opening the port to the
 public internet.
 
+On macOS, open **System Settings → Privacy & Security → Local Network** and
+enable Pair. If pairing was attempted before permission was granted, restart
+both copies of Pair and use Refresh. Ad-hoc signed development builds can ask
+again after an update.
+
 On Linux, firewall commands depend on the distribution. If UFW is active, an
 administrator can allow the default Pair port from the local subnet, for
 example:
@@ -36,8 +45,10 @@ TCP connection succeeds.
 ## Saved identity changed
 
 Pair fails closed when the host certificate differs from the saved pin. Confirm
-that the host intentionally reset its Pair identity. Then stop Pair, use
-**Forget Device** on both computers, and repeat phrase verification.
+that the host intentionally reset its Pair identity, remove the remembered host
+on the connecting computer, and repeat phrase verification. If the certificate
+still matches but the reconnect token is stale, Pair opens Repair Pairing and
+asks both users to compare a fresh phrase.
 
 ## Jetson Nano
 

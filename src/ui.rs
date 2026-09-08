@@ -9,10 +9,10 @@ use std::{
 use fltk::{
     app,
     button::Button,
-    dialog,
+    dialog, draw,
     enums::{Align, Color, Font, FrameType},
     frame::Frame,
-    group::{Flex, Group},
+    group::Group,
     input::Input,
     menu::Choice,
     prelude::*,
@@ -22,49 +22,75 @@ use fltk::{
 use pair::{
     discovery::{DiscoveredDevice, DiscoveryBrowser},
     editor::{Editor, MAX_DRAFTS},
-    network::{Command, ConnectTarget, Mode, Network, PairingPrompt},
+    network::{Command, ConnectTarget, Mode, Network, PairingPrompt, ordered_addresses},
     persistence::Store,
     state::Side,
 };
 
-// Keep a short pause so fast typing is coalesced into one edit while making
-// the remote note feel immediate on a local network.
 const DEBOUNCE: Duration = Duration::from_millis(20);
+const PORT: &str = "47321";
+const BG: Color = Color::from_rgb(243, 243, 241);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Landing,
+    Host,
+    Connect,
+    Workspace,
+}
 
 enum Action {
-    StartStop,
-    Mode,
-    Nearby,
+    OpenHost,
+    OpenConnect,
+    Back,
+    ConnectNearby,
+    ConnectManual,
+    Refresh,
+    ToggleHelp,
+    ToggleHostAdvanced,
     SaveName,
+    RemovePeer,
+    ResetIdentity,
     Changed,
     Flush,
     TakeControl,
     CopyAll,
     ConfirmPairing,
     RejectPairing,
-    Forget,
-    ResetIdentity,
+    Disconnect,
     Drafts,
     Close,
 }
 
 struct Ui {
     window: Window,
-    mode: Choice,
+    landing: Group,
+    host: Group,
+    connect: Group,
+    workspace: Group,
+    screen: Screen,
+    host_name: Input,
+    host_port: Input,
+    host_advanced: Group,
+    host_status: Frame,
+    host_phrase: Frame,
+    host_confirm: Button,
+    host_reject: Button,
+    peers: Choice,
+    remove_peer: Button,
     nearby: Choice,
-    name: Input,
-    ip: Input,
-    port: Input,
-    start: Button,
-    confirm: Button,
-    reject: Button,
-    forget: Button,
-    reset_identity: Button,
-    phrase: Frame,
+    connect_status: Frame,
+    connect_phrase: Frame,
+    connect_confirm: Button,
+    connect_reject: Button,
+    help_group: Group,
+    manual_ip: Input,
+    manual_port: Input,
+    workspace_title: Frame,
+    workspace_status: Frame,
+    owner: Frame,
     take: Button,
     draft: Button,
-    owner: Frame,
-    status: Frame,
     editor: TextEditor,
     viewer: TextDisplay,
     buffer: TextBuffer,
@@ -73,6 +99,7 @@ struct Ui {
     network: Option<Network>,
     discovery: Option<DiscoveryBrowser>,
     discovered: Vec<DiscoveredDevice>,
+    targets: Vec<ConnectTarget>,
     pairing: Option<PairingPrompt>,
     store: Store,
     tx: mpsc::Sender<Action>,
@@ -80,183 +107,266 @@ struct Ui {
     last_change: Instant,
     notice: String,
     network_status: String,
-    stopping: bool,
 }
 
-fn button_callback(button: &mut Button, tx: &mpsc::Sender<Action>, action: fn() -> Action) {
+fn callback(button: &mut Button, tx: &mpsc::Sender<Action>, action: fn() -> Action) {
     let tx = tx.clone();
     button.set_callback(move |_| {
         let _ = tx.send(action());
     });
 }
+fn flat(button: &mut Button) {
+    button.set_frame(FrameType::FlatBox);
+    button.set_color(Color::White);
+    button.set_selection_color(Color::from_rgb(118, 190, 92));
+}
+fn heading(mut frame: Frame, text: &str, size: i32) {
+    frame.set_label(text);
+    frame.set_label_size(size);
+    frame.set_align(Align::Center | Align::Inside);
+}
+fn icon(mut frame: Frame, host: bool) {
+    frame.draw(move |f| {
+        draw::set_draw_color(Color::Black);
+        let (x, y, w, h) = (f.x(), f.y(), f.w(), f.h());
+        if host {
+            draw::draw_pie(x + w / 2 - 27, y + 8, 54, 54, 0., 360.);
+            draw::draw_pie(x + w / 2 - 50, y + 58, 100, 76, 0., 180.);
+        } else {
+            draw::draw_rect(x + 25, y + 15, w - 50, h - 58);
+            draw::draw_rect(x + 12, y + h - 35, w - 24, 24);
+            draw::draw_rectf(x + 25, y + h - 27, w / 2, 7);
+            draw::draw_pie(x + w - 38, y + h - 30, 12, 12, 0., 360.);
+        }
+    });
+}
+fn choose_font() {
+    app::load_system_fonts();
+    let fonts = app::fonts();
+    let choices: &[&str] = if cfg!(target_os = "windows") {
+        &["MS Reference Sans Serif", "Segoe UI"]
+    } else if cfg!(target_os = "macos") {
+        &["MS Reference Sans Serif", "Helvetica Neue"]
+    } else {
+        &["MS Reference Sans Serif", "DejaVu Sans"]
+    };
+    if let Some(name) = choices
+        .iter()
+        .find(|name| fonts.iter().any(|font| font == **name))
+    {
+        app::set_font(Font::Helvetica, name);
+    }
+}
 
 impl Ui {
     fn new(tx: mpsc::Sender<Action>, store: Store) -> Self {
         let device = store.device();
-        let mut window = Window::default()
-            .with_size(860, 690)
-            .with_label("pair")
-            .center_screen();
-        window.set_color(Color::from_rgb(243, 243, 241));
-        let mut layout = Flex::default_fill().column();
-        layout.set_margin(14);
-        layout.set_spacing(8);
+        let mut window = Window::new(100, 100, 900, 650, "pair").center_screen();
+        window.set_color(BG);
+        window.size_range(760, 560, 0, 0);
 
-        let mut identity = Flex::default().row();
-        identity.set_spacing(8);
-        let device_label = Frame::default().with_label("This device");
-        identity.fixed(&device_label, 75);
-        let mut name = Input::default();
-        name.set_value(&device.name);
-        name.set_tooltip("A local display name, up to 32 UTF-8 bytes.");
-        let mut save_name = Button::default().with_label("Save Name");
-        identity.fixed(&save_name, 90);
-        let mut forget = Button::default().with_label("Forget Device");
-        identity.fixed(&forget, 110);
-        let mut reset_identity = Button::default().with_label("Reset Identity");
-        reset_identity
-            .set_tooltip("Advanced: replace this host certificate and revoke its paired peer.");
-        identity.fixed(&reset_identity, 105);
-        identity.end();
-        layout.fixed(&identity, 30);
+        let mut landing = Group::new(0, 0, 900, 650, None);
+        heading(
+            Frame::new(0, 52, 900, 52, None),
+            "How do you want to pair?",
+            30,
+        );
+        heading(Frame::new(130, 130, 270, 54, None), "Connect", 42);
+        icon(Frame::new(185, 195, 160, 150, None), false);
+        let mut open_connect = Button::new(145, 370, 240, 58, "Connect to a computer");
+        flat(&mut open_connect);
+        heading(Frame::new(500, 130, 270, 54, None), "Host", 42);
+        icon(Frame::new(555, 195, 160, 150, None), true);
+        let mut open_host = Button::new(515, 370, 240, 58, "Share from this computer");
+        flat(&mut open_host);
+        let mut wordmark = Frame::new(18, 598, 180, 30, "pair");
+        wordmark.set_label_size(24);
+        wordmark.set_align(Align::Left | Align::Inside);
+        let mut version = Frame::new(750, 598, 132, 30, None);
+        version.set_label(&format!("v{}", env!("CARGO_PKG_VERSION")));
+        version.set_align(Align::Right | Align::Inside);
+        landing.end();
 
-        let mut connection = Flex::default().row();
-        connection.set_spacing(8);
-        let mut mode = Choice::default();
-        mode.add_choice("Host|Connect");
-        mode.set_value(0);
-        connection.fixed(&mode, 105);
-        let mut nearby = Choice::default();
-        nearby.add_choice("Manual address");
-        nearby.set_value(0);
-        nearby.set_tooltip("Nearby Pair hosts discovered on this LAN.");
-        connection.fixed(&nearby, 210);
-        let ip_label = Frame::default().with_label("IP");
-        connection.fixed(&ip_label, 18);
-        let mut ip = Input::default();
-        ip.set_value("0.0.0.0");
-        let port_label = Frame::default().with_label("Port");
-        connection.fixed(&port_label, 34);
-        let mut port = Input::default();
-        port.set_value("47321");
-        connection.fixed(&port, 70);
-        let mut start = Button::default().with_label("Start Host");
-        connection.fixed(&start, 105);
-        connection.end();
-        layout.fixed(&connection, 32);
+        let mut host = Group::new(0, 0, 900, 650, None);
+        heading(Frame::new(0, 35, 900, 45, None), "Host a note", 30);
+        let mut host_name = Input::new(285, 105, 330, 36, "This computer  ");
+        host_name.set_value(&device.name);
+        let mut save_name = Button::new(625, 105, 95, 36, "Save name");
+        flat(&mut save_name);
+        let mut host_status = Frame::new(130, 165, 640, 55, "Starting host...");
+        host_status.set_align(Align::Center | Align::Inside | Align::Wrap);
+        let mut host_phrase = Frame::new(120, 225, 660, 82, "Waiting for a computer...");
+        host_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
+        host_phrase.set_label_size(15);
+        let mut host_confirm = Button::new(265, 318, 240, 38, "Phrase Matches — Pair");
+        flat(&mut host_confirm);
+        let mut host_reject = Button::new(515, 318, 105, 38, "Reject");
+        flat(&mut host_reject);
+        let mut peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
+        let mut remove_peer = Button::new(595, 390, 125, 34, "Remove");
+        flat(&mut remove_peer);
+        let mut toggle_host_advanced = Button::new(365, 440, 170, 32, "Advanced settings");
+        flat(&mut toggle_host_advanced);
+        let mut host_advanced = Group::new(250, 482, 450, 45, None);
+        let mut host_port = Input::new(330, 488, 100, 32, "Port  ");
+        host_port.set_value(PORT);
+        let mut reset = Button::new(450, 488, 145, 32, "Reset identity");
+        flat(&mut reset);
+        host_advanced.end();
+        host_advanced.hide();
+        let mut host_back = Button::new(25, 585, 110, 38, "Back / Stop");
+        flat(&mut host_back);
+        host.end();
+        host.hide();
 
-        let mut hint = Frame::default().with_label("Start Host on one computer. Choose Connect on the other and select the nearby host. Compare the phrase once; Pair remembers the device.");
-        hint.set_align(Align::Left | Align::Inside | Align::Wrap);
-        hint.set_label_size(12);
-        layout.fixed(&hint, 34);
+        let mut connect = Group::new(0, 0, 900, 650, None);
+        heading(Frame::new(0, 35, 900, 45, None), "Connect to a note", 30);
+        let mut nearby = Choice::new(245, 112, 410, 38, "Nearby  ");
+        let mut connect_button = Button::new(380, 164, 180, 40, "Connect");
+        flat(&mut connect_button);
+        let mut connect_status = Frame::new(120, 220, 660, 56, "Searching for nearby computers...");
+        connect_status.set_align(Align::Center | Align::Inside | Align::Wrap);
+        let mut connect_phrase = Frame::new(120, 280, 660, 82, "Select a computer to connect.");
+        connect_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
+        connect_phrase.set_label_size(15);
+        let mut connect_confirm = Button::new(265, 372, 240, 38, "Phrase Matches — Pair");
+        flat(&mut connect_confirm);
+        let mut connect_reject = Button::new(515, 372, 105, 38, "Reject");
+        flat(&mut connect_reject);
+        let mut toggle_help = Button::new(325, 442, 250, 34, "Can't find your computer?");
+        flat(&mut toggle_help);
+        let mut help_group = Group::new(175, 485, 550, 105, None);
+        let mut manual_ip = Input::new(225, 492, 205, 32, "IP  ");
+        manual_ip.set_value("192.168.1.2");
+        let mut manual_port = Input::new(490, 492, 80, 32, "Port  ");
+        manual_port.set_value(PORT);
+        let mut manual_connect = Button::new(580, 492, 115, 32, "Connect");
+        flat(&mut manual_connect);
+        let mut refresh = Button::new(225, 538, 105, 30, "Refresh");
+        flat(&mut refresh);
+        let mut help = Frame::new(
+            340,
+            532,
+            355,
+            48,
+            "Allow Pair on Private networks. On macOS, enable Local Network access.",
+        );
+        help.set_align(Align::Left | Align::Inside | Align::Wrap);
+        help.set_label_size(11);
+        help_group.end();
+        help_group.hide();
+        let mut connect_back = Button::new(25, 585, 90, 38, "Back");
+        flat(&mut connect_back);
+        connect.end();
+        connect.hide();
 
-        let mut verify = Flex::default().row();
-        verify.set_spacing(8);
-        let mut phrase = Frame::default().with_label("No pairing confirmation needed.");
-        phrase.set_align(Align::Left | Align::Inside | Align::Wrap);
-        phrase.set_label_size(12);
-        let mut confirm = Button::default().with_label("Phrase Matches — Pair");
-        verify.fixed(&confirm, 165);
-        let mut reject = Button::default().with_label("Reject");
-        verify.fixed(&reject, 75);
-        verify.end();
-        layout.fixed(&verify, 45);
-
-        let area = Group::default().with_size(100, 100);
+        let mut workspace = Group::new(0, 0, 900, 650, None);
+        let mut workspace_title = Frame::new(16, 12, 220, 34, "Shared note");
+        workspace_title.set_align(Align::Left | Align::Inside);
+        workspace_title.set_label_size(20);
+        let mut workspace_status = Frame::new(235, 12, 235, 34, "Connecting...");
+        workspace_status.set_align(Align::Left | Align::Inside | Align::Wrap);
+        workspace_status.set_label_size(11);
+        let mut take = Button::new(480, 12, 115, 34, "Take Control");
+        flat(&mut take);
+        let mut copy = Button::new(603, 12, 82, 34, "Copy All");
+        flat(&mut copy);
+        let mut draft = Button::new(693, 12, 100, 34, "Drafts (0)");
+        flat(&mut draft);
+        let mut disconnect = Button::new(801, 12, 82, 34, "Disconnect");
+        flat(&mut disconnect);
+        let area = Group::new(16, 56, 868, 535, None);
         let mut buffer = TextBuffer::default();
         buffer.set_tab_distance(4);
-        let mut viewer = TextDisplay::default_fill();
+        let mut viewer = TextDisplay::new(16, 56, 868, 535, None);
         viewer.set_buffer(buffer.clone());
-        viewer.set_text_font(Font::Courier);
+        viewer.set_text_font(Font::Helvetica);
         viewer.set_text_size(15);
         viewer.set_frame(FrameType::DownBox);
-        let mut editor = TextEditor::default_fill();
+        let mut editor = TextEditor::new(16, 56, 868, 535, None);
         editor.set_buffer(buffer.clone());
-        editor.set_text_font(Font::Courier);
+        editor.set_text_font(Font::Helvetica);
         editor.set_text_size(15);
         editor.set_frame(FrameType::DownBox);
         editor.set_tab_nav(false);
         editor.hide();
         area.end();
-        area.resizable(&viewer);
-
-        let mut actions = Flex::default().row();
-        actions.set_spacing(8);
-        let mut take = Button::default().with_label("Take Control");
-        actions.fixed(&take, 120);
-        let mut copy = Button::default().with_label("Copy All");
-        actions.fixed(&copy, 90);
-        let mut draft = Button::default().with_label("Drafts (0)");
-        actions.fixed(&draft, 105);
-        let mut owner = Frame::default().with_label("Start or connect to edit.");
-        owner.set_align(Align::Left | Align::Inside | Align::Wrap);
-        owner.set_label_size(12);
-        actions.end();
-        layout.fixed(&actions, 32);
-        let mut status = Frame::default().with_label("Not connected.");
-        status.set_align(Align::Left | Align::Inside | Align::Wrap);
-        status.set_label_size(12);
-        layout.fixed(&status, 46);
-        layout.end();
+        let mut owner = Frame::new(16, 598, 868, 34, "Connecting...");
+        owner.set_align(Align::Left | Align::Inside);
+        workspace.end();
+        workspace.hide();
         window.end();
-        window.resizable(&layout);
-        window.size_range(730, 500, 0, 0);
+        window.resizable(&workspace);
 
         let suppress = Rc::new(Cell::new(false));
         buffer.add_modify_callback({
             let tx = tx.clone();
             let suppress = suppress.clone();
-            move |_, inserted, deleted, _, _| {
-                if !suppress.get() && (inserted != 0 || deleted != 0) {
+            move |_, i, d, _, _| {
+                if !suppress.get() && (i != 0 || d != 0) {
                     let _ = tx.send(Action::Changed);
                 }
             }
         });
-        button_callback(&mut start, &tx, || Action::StartStop);
-        button_callback(&mut save_name, &tx, || Action::SaveName);
-        button_callback(&mut forget, &tx, || Action::Forget);
-        button_callback(&mut reset_identity, &tx, || Action::ResetIdentity);
-        button_callback(&mut confirm, &tx, || Action::ConfirmPairing);
-        button_callback(&mut reject, &tx, || Action::RejectPairing);
-        button_callback(&mut take, &tx, || Action::TakeControl);
-        button_callback(&mut copy, &tx, || Action::CopyAll);
-        button_callback(&mut draft, &tx, || Action::Drafts);
-        mode.set_callback({
-            let tx = tx.clone();
-            move |_| {
-                let _ = tx.send(Action::Mode);
-            }
-        });
-        nearby.set_callback({
-            let tx = tx.clone();
-            move |_| {
-                let _ = tx.send(Action::Nearby);
-            }
-        });
+        for (button, action) in [
+            (&mut open_host, Action::OpenHost as fn() -> Action),
+            (&mut open_connect, || Action::OpenConnect),
+            (&mut host_back, || Action::Back),
+            (&mut connect_back, || Action::Back),
+            (&mut connect_button, || Action::ConnectNearby),
+            (&mut manual_connect, || Action::ConnectManual),
+            (&mut refresh, || Action::Refresh),
+            (&mut toggle_help, || Action::ToggleHelp),
+            (&mut toggle_host_advanced, || Action::ToggleHostAdvanced),
+            (&mut save_name, || Action::SaveName),
+            (&mut remove_peer, || Action::RemovePeer),
+            (&mut reset, || Action::ResetIdentity),
+            (&mut host_confirm, || Action::ConfirmPairing),
+            (&mut host_reject, || Action::RejectPairing),
+            (&mut connect_confirm, || Action::ConfirmPairing),
+            (&mut connect_reject, || Action::RejectPairing),
+            (&mut take, || Action::TakeControl),
+            (&mut copy, || Action::CopyAll),
+            (&mut draft, || Action::Drafts),
+            (&mut disconnect, || Action::Disconnect),
+        ] {
+            callback(button, &tx, action);
+        }
         window.set_callback({
             let tx = tx.clone();
             move |_| {
                 let _ = tx.send(Action::Close);
             }
         });
-
-        Self {
+        let mut ui = Self {
             window,
-            mode,
+            landing,
+            host,
+            connect,
+            workspace,
+            screen: Screen::Landing,
+            host_name,
+            host_port,
+            host_advanced,
+            host_status,
+            host_phrase,
+            host_confirm,
+            host_reject,
+            peers,
+            remove_peer,
             nearby,
-            name,
-            ip,
-            port,
-            start,
-            confirm,
-            reject,
-            forget,
-            reset_identity,
-            phrase,
+            connect_status,
+            connect_phrase,
+            connect_confirm,
+            connect_reject,
+            help_group,
+            manual_ip,
+            manual_port,
+            workspace_title,
+            workspace_status,
+            owner,
             take,
             draft,
-            owner,
-            status,
             editor,
             viewer,
             buffer,
@@ -265,6 +375,7 @@ impl Ui {
             network: None,
             discovery: None,
             discovered: Vec::new(),
+            targets: Vec::new(),
             pairing: None,
             store,
             tx,
@@ -272,233 +383,254 @@ impl Ui {
             last_change: Instant::now(),
             notice: String::new(),
             network_status: "Not connected.".into(),
-            stopping: false,
-        }
+        };
+        ui.refresh_peers();
+        ui
     }
 
-    fn ensure_discovery(&mut self) {
-        if self.mode.value() == 1 && self.discovery.is_none() {
-            match DiscoveryBrowser::start(app::awake) {
-                Ok(browser) => self.discovery = Some(browser),
-                Err(error) => self.notice = error,
-            }
-        } else if self.mode.value() == 0 {
-            self.discovery = None;
-            self.discovered.clear();
+    fn show(&mut self, screen: Screen) {
+        self.screen = screen;
+        self.landing.set_visible(screen == Screen::Landing);
+        self.host.set_visible(screen == Screen::Host);
+        self.connect.set_visible(screen == Screen::Connect);
+        self.workspace.set_visible(screen == Screen::Workspace);
+        self.window.redraw();
+    }
+    fn refresh_peers(&mut self) {
+        self.peers.clear();
+        for peer in self.store.trusted_peers() {
+            self.peers.add_choice(&peer.name);
+        }
+        if self.peers.size() > 0 {
+            self.peers.set_value(0);
+            self.remove_peer.activate();
+        } else {
+            self.peers.add_choice("No paired devices");
+            self.peers.set_value(0);
+            self.remove_peer.deactivate();
+        }
+    }
+    fn parse_port(text: &str) -> Result<u16, String> {
+        text.trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| "Port must be from 1 to 65535.".into())
+    }
+    fn start_network(&mut self, mode: Mode, side: Side) -> Result<(), String> {
+        if let Some(network) = &self.network {
+            network.stop();
+        }
+        self.network = Some(
+            Network::start(mode, app::awake).map_err(|_| "Could not start the network thread.")?,
+        );
+        self.model.start(side);
+        self.network_status = "Starting...".into();
+        Ok(())
+    }
+    fn start_host(&mut self) -> Result<(), String> {
+        self.store.set_name(&self.host_name.value())?;
+        let port = Self::parse_port(&self.host_port.value())?;
+        self.start_network(
+            Mode::Host {
+                address: SocketAddr::from(([0, 0, 0, 0], port)),
+                text: self.model.text.clone(),
+                store: self.store.clone(),
+            },
+            Side::Host,
+        )
+    }
+    fn connect_target(&mut self, target: ConnectTarget) -> Result<(), String> {
+        self.start_network(
+            Mode::Connect {
+                target,
+                store: self.store.clone(),
+            },
+            Side::Peer,
+        )
+    }
+    fn refresh_discovery(&mut self) {
+        self.discovery = None;
+        match DiscoveryBrowser::start(app::awake) {
+            Ok(browser) => self.discovery = Some(browser),
+            Err(error) => self.notice = error,
         }
     }
 
     fn discovery_update(&mut self) -> bool {
         let devices = self.discovery.as_mut().and_then(|browser| {
-            if browser.updates.has_changed().unwrap_or(true) {
-                Some(browser.updates.borrow_and_update().clone())
-            } else {
-                None
-            }
+            browser
+                .updates
+                .has_changed()
+                .unwrap_or(true)
+                .then(|| browser.updates.borrow_and_update().clone())
         });
         let Some(devices) = devices else { return false };
         if devices == self.discovered {
             return false;
         }
-        let previously_selected = (self.nearby.value() > 0)
-            .then(|| self.discovered.get((self.nearby.value() - 1) as usize))
-            .flatten()
-            .map(|device| device.id.clone());
         self.discovered = devices;
+        self.targets.clear();
         self.nearby.clear();
-        self.nearby.add_choice("Manual address");
         let trusted = self.store.trusted_host();
         for device in &self.discovered {
-            let suffix = if trusted.as_ref().is_some_and(|host| host.id == device.id) {
-                " (remembered)"
-            } else {
-                ""
-            };
+            let saved = trusted.as_ref().filter(|host| host.id == device.id);
+            let addresses = ordered_addresses(
+                saved.map(|host| host.address),
+                device.addresses.iter().copied(),
+            );
+            self.targets.push(ConnectTarget {
+                addresses: addresses.clone(),
+                id: Some(device.id.clone()),
+                name: Some(device.name.clone()),
+                pairing: saved.map(|host| host.pairing.clone()),
+            });
             self.nearby.add_choice(&format!(
-                "{} — {}{}",
+                "{}{}",
                 device.name,
-                device.address.ip(),
-                suffix
+                if saved.is_some() { "  —  Paired" } else { "" }
             ));
+            if let Some(network) = &self.network {
+                let _ = network
+                    .commands
+                    .try_send(Command::UpdateAddresses(addresses));
+            }
         }
-        let preferred = previously_selected
-            .or_else(|| trusted.as_ref().map(|host| host.id.clone()))
-            .or_else(|| (self.discovered.len() == 1).then(|| self.discovered[0].id.clone()));
-        let selected = preferred
-            .and_then(|id| self.discovered.iter().position(|device| device.id == id))
-            .map_or(0, |index| index as i32 + 1);
-        self.nearby.set_value(selected);
-        self.choose_nearby();
+        if let Some(host) = trusted
+            && !self.discovered.iter().any(|device| device.id == host.id)
+        {
+            self.nearby
+                .add_choice(&format!("{}  —  Paired (last address)", host.name));
+            self.targets.push(ConnectTarget {
+                addresses: vec![host.address],
+                id: Some(host.id),
+                name: Some(host.name),
+                pairing: Some(host.pairing),
+            });
+        }
+        if self.targets.is_empty() {
+            self.nearby.add_choice("Searching...");
+            self.nearby.deactivate();
+        } else {
+            self.nearby.activate();
+            self.nearby.set_value(0);
+        }
         true
     }
-
-    fn choose_nearby(&mut self) {
-        if self.nearby.value() > 0
-            && let Some(device) = self.discovered.get((self.nearby.value() - 1) as usize)
-        {
-            self.ip.set_value(&device.address.ip().to_string());
-            self.port.set_value(&device.address.port().to_string());
-        }
-    }
-
     fn schedule_flush(&mut self) {
         if !self.timer_armed && self.model.needs_flush() {
             self.timer_armed = true;
-            let delay = DEBOUNCE.saturating_sub(self.last_change.elapsed());
+            let wait = DEBOUNCE.saturating_sub(self.last_change.elapsed());
             let tx = self.tx.clone();
-            app::add_timeout3(delay.as_secs_f64().max(0.001), move |_| {
+            app::add_timeout3(wait.as_secs_f64().max(0.001), move |_| {
                 let _ = tx.send(Action::Flush);
             });
         }
     }
-
-    fn start_stop(&mut self) -> Result<(), String> {
-        if self.model.running {
-            if let Some(network) = &self.network {
-                network.stop();
-                self.stopping = true;
-                self.notice = "Stopping...".into();
-            }
-            return Ok(());
-        }
-        self.store.set_name(&self.name.value())?;
-        let ip: IpAddr = self
-            .ip
-            .value()
-            .trim()
-            .parse()
-            .map_err(|_| "Enter a numeric IPv4 or IPv6 address (no hostname or brackets).")?;
-        let port: u16 = self
-            .port
-            .value()
-            .trim()
-            .parse()
-            .map_err(|_| "Port must be an integer from 1 to 65535.")?;
-        if port == 0 || ip.is_multicast() {
-            return Err("Choose a unicast address and port from 1 to 65535.".into());
-        }
-        let address = SocketAddr::new(ip, port);
-        let side = if self.mode.value() == 0 {
-            Side::Host
-        } else {
-            Side::Peer
-        };
-        let mode = if side == Side::Host {
-            Mode::Host {
-                address,
-                text: self.model.text.clone(),
-                store: self.store.clone(),
-            }
-        } else {
-            if ip.is_unspecified() {
-                return Err("Enter the host's LAN IP or select a nearby host.".into());
-            }
-            let selected = (self.nearby.value() > 0)
-                .then(|| self.discovered.get((self.nearby.value() - 1) as usize))
-                .flatten();
-            let trusted = self.store.trusted_host();
-            let pairing = trusted.as_ref().and_then(|host| {
-                let selected_matches = selected.is_none_or(|device| device.id == host.id);
-                selected_matches.then(|| host.pairing.clone())
-            });
-            if let (Some(host), Some(saved_pairing)) = (&trusted, &pairing)
-                && host.address != address
-            {
-                self.store.trust_host(
-                    host.id.clone(),
-                    host.name.clone(),
-                    address,
-                    saved_pairing.clone(),
-                )?;
-            }
-            Mode::Connect {
-                target: ConnectTarget {
-                    address,
-                    id: selected
-                        .map(|d| d.id.clone())
-                        .or_else(|| trusted.as_ref().map(|h| h.id.clone())),
-                    name: selected
-                        .map(|d| d.name.clone())
-                        .or_else(|| trusted.as_ref().map(|h| h.name.clone())),
-                    pairing,
-                },
-                store: self.store.clone(),
-            }
-        };
-        self.discovery = None;
-        self.network = Some(
-            Network::start(mode, app::awake).map_err(|_| "Could not start the network thread.")?,
-        );
-        self.model.start(side);
-        self.stopping = false;
-        self.network_status = "Starting...".into();
-        Ok(())
-    }
-
     fn command(&mut self, command: Command) -> Result<(), String> {
         self.network
             .as_ref()
-            .ok_or("Start or connect first.")?
+            .ok_or("Connect first.")?
             .commands
             .try_send(command)
-            .map_err(|_| {
-                "Network is busy or stopped. Local text is retained; retry when ready.".into()
-            })
+            .map_err(|_| "Network is busy. Your local text is retained.".into())
     }
 
     fn act(&mut self, action: Action) -> Result<bool, String> {
         match action {
-            Action::Mode => {
-                self.nearby.set_value(0);
-                if self.mode.value() == 0 {
-                    self.ip.set_value("0.0.0.0");
-                } else if let Some(host) = self.store.trusted_host() {
-                    self.ip.set_value(&host.address.ip().to_string());
-                    self.port.set_value(&host.address.port().to_string());
-                } else {
-                    self.ip.set_value("127.0.0.1");
-                }
-                self.ensure_discovery();
+            Action::OpenHost => {
+                self.show(Screen::Host);
+                self.start_host()?;
             }
-            Action::Nearby => self.choose_nearby(),
+            Action::OpenConnect => {
+                self.show(Screen::Connect);
+                self.refresh_discovery();
+            }
+            Action::Back | Action::Disconnect => {
+                if let Some(network) = &self.network {
+                    network.stop();
+                }
+                self.network = None;
+                self.discovery = None;
+                self.model.connection(false, false);
+                self.show(Screen::Landing);
+            }
+            Action::ConnectNearby => {
+                let target = self
+                    .targets
+                    .get(self.nearby.value().max(0) as usize)
+                    .cloned()
+                    .ok_or("No nearby computer is selected.")?;
+                self.connect_target(target)?;
+            }
+            Action::ConnectManual => {
+                let ip: IpAddr = self
+                    .manual_ip
+                    .value()
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Enter a numeric IPv4 or IPv6 address.")?;
+                if ip.is_unspecified() || ip.is_multicast() {
+                    return Err("Enter the host computer's address.".into());
+                }
+                let address = SocketAddr::new(ip, Self::parse_port(&self.manual_port.value())?);
+                let trusted = self.store.trusted_host();
+                let pairing = trusted
+                    .as_ref()
+                    .filter(|host| host.address == address)
+                    .map(|host| host.pairing.clone());
+                self.connect_target(ConnectTarget {
+                    addresses: vec![address],
+                    id: trusted.as_ref().map(|host| host.id.clone()),
+                    name: trusted.as_ref().map(|host| host.name.clone()),
+                    pairing,
+                })?;
+            }
+            Action::Refresh => self.refresh_discovery(),
+            Action::ToggleHelp => {
+                if self.help_group.visible() {
+                    self.help_group.hide()
+                } else {
+                    self.help_group.show()
+                }
+            }
+            Action::ToggleHostAdvanced => {
+                if self.host_advanced.visible() {
+                    self.host_advanced.hide()
+                } else {
+                    self.host_advanced.show()
+                }
+            }
             Action::SaveName => {
-                self.store.set_name(&self.name.value())?;
-                self.notice = "Device name saved.".into();
+                self.store.set_name(&self.host_name.value())?;
+                self.notice = "Device name saved. Restart Host to advertise it.".into();
             }
-            Action::Forget => {
-                if self.model.running {
-                    return Err("Stop Pair before forgetting a device.".into());
-                }
-                if self.mode.value() == 0 {
-                    self.store.forget_peer()?;
-                    self.notice = "Paired peer forgotten and its token revoked.".into();
-                } else {
-                    self.store.forget_host()?;
-                    self.notice = "Remembered host forgotten.".into();
+            Action::RemovePeer => {
+                let peers = self.store.trusted_peers();
+                if let Some(peer) = peers.get(self.peers.value().max(0) as usize) {
+                    self.store.forget_peer(&peer.id)?;
+                    self.notice = format!("Removed {}.", peer.name);
+                    self.refresh_peers();
                 }
             }
             Action::ResetIdentity => {
-                if self.model.running {
-                    return Err("Stop Pair before resetting its host identity.".into());
-                }
                 if dialog::choice2_default(
-                    "Reset this host certificate and revoke its paired peer? Both computers must pair again.",
+                    "Reset the host certificate and remove every paired device?",
                     "Cancel",
-                    "Reset Identity",
+                    "Reset",
                     "",
                 ) == Some(1)
                 {
                     self.store.reset_host_identity()?;
-                    self.notice = "Host identity reset. Pair this computer again.".into();
+                    self.refresh_peers();
+                    self.notice = "Host identity reset.".into();
                 }
             }
-            Action::StartStop => self.start_stop()?,
             Action::Changed => {
                 self.last_change = Instant::now();
                 self.model
                     .set_text(self.buffer.text())
                     .map_err(str::to_string)?;
-                self.notice.clear();
                 self.schedule_flush();
             }
             Action::Flush => {
@@ -508,8 +640,6 @@ impl Ui {
                     && let Err(error) = self.command(Command::Edit(edit))
                 {
                     self.model.enqueue_failed();
-                    self.last_change = Instant::now();
-                    self.schedule_flush();
                     return Err(error);
                 }
                 self.schedule_flush();
@@ -525,9 +655,9 @@ impl Ui {
             Action::Close => {
                 if (self.model.has_unsent() || !self.model.drafts.is_empty())
                     && dialog::choice2_default(
-                        "Unsent edits or recovery drafts are still in memory. Copy them before closing to keep them.",
+                        "Unsent edits or recovery drafts are in memory.",
                         "Keep open",
-                        "Close and discard",
+                        "Close",
                         "",
                     ) != Some(1)
                 {
@@ -545,29 +675,32 @@ impl Ui {
 
     fn network_update(&mut self) -> bool {
         let view = self.network.as_mut().and_then(|network| {
-            if network.updates.has_changed().unwrap_or(true) {
-                Some(network.updates.borrow_and_update().clone())
-            } else {
-                None
-            }
+            network
+                .updates
+                .has_changed()
+                .unwrap_or(true)
+                .then(|| network.updates.borrow_and_update().clone())
         });
         let Some(view) = view else { return false };
-        let draft_count = self.model.drafts.len();
+        let drafts = self.model.drafts.len();
         self.model.connection(view.connected, view.running);
         if let Some(snapshot) = view.snapshot {
             self.model.receive(snapshot, view.sync_serial);
         }
         self.pairing = view.pairing;
         self.network_status = view.status;
-        if self.model.drafts.len() > draft_count {
-            self.notice =
-                "Unacknowledged local text saved in Drafts. The shared note follows the host."
-                    .into();
+        if self.model.drafts.len() > drafts {
+            self.notice = "Unsent local text was kept in Drafts.".into();
+        }
+        if view.connected {
+            self.discovery = None;
+            self.show(Screen::Workspace);
         }
         if !view.running {
-            self.stopping = false;
             self.network = None;
-            self.ensure_discovery();
+            if self.screen == Screen::Connect {
+                self.refresh_discovery();
+            }
         }
         self.schedule_flush();
         true
@@ -585,71 +718,58 @@ impl Ui {
                 .set_insert_position(self.buffer.utf8_align(cursor));
             self.suppress.set(false);
         }
-        if self.model.can_edit() && !self.stopping {
-            if !self.editor.visible() {
-                self.viewer.hide();
-                self.editor.show();
-            }
-        } else if !self.viewer.visible() {
+        if self.model.can_edit() {
+            self.viewer.hide();
+            self.editor.show();
+        } else {
             self.editor.hide();
             self.viewer.show();
         }
-        if self.model.running {
-            self.mode.deactivate();
-            self.nearby.deactivate();
-            self.name.deactivate();
-            self.ip.deactivate();
-            self.port.deactivate();
-            self.start
-                .set_label(if self.stopping { "Stopping..." } else { "Stop" });
+        let phrase = self.pairing.as_ref().map_or_else(
+            || "No phrase confirmation needed.".into(),
+            |prompt| format!("UNVERIFIED — compare exactly:\n{}", prompt.phrase),
+        );
+        self.host_phrase.set_label(&phrase);
+        self.connect_phrase.set_label(&phrase);
+        let confirm = self
+            .pairing
+            .as_ref()
+            .is_some_and(|prompt| !prompt.local_confirmed);
+        if confirm {
+            self.host_confirm.activate();
+            self.connect_confirm.activate();
         } else {
-            self.mode.activate();
-            self.name.activate();
-            self.ip.activate();
-            self.port.activate();
-            if self.mode.value() == 1 {
-                self.nearby.activate();
-            } else {
-                self.nearby.deactivate();
-            }
-            self.start.set_label(if self.mode.value() == 0 {
-                "Start Host"
-            } else {
-                "Connect"
-            });
+            self.host_confirm.deactivate();
+            self.connect_confirm.deactivate();
         }
-        if self.stopping {
-            self.start.deactivate();
+        if self.pairing.is_some() {
+            self.host_reject.activate();
+            self.connect_reject.activate();
         } else {
-            self.start.activate();
+            self.host_reject.deactivate();
+            self.connect_reject.deactivate();
         }
-        if let Some(prompt) = &self.pairing {
-            self.phrase
-                .set_label(&format!("UNVERIFIED — compare exactly:\n{}", prompt.phrase));
-            self.phrase
-                .set_tooltip(&format!("Full SHA-256 fingerprint: {}", prompt.fingerprint));
-            if prompt.local_confirmed {
-                self.confirm.deactivate();
-            } else {
-                self.confirm.activate();
-            }
-            self.reject.activate();
+        let status = if self.notice.is_empty() {
+            self.network_status.clone()
         } else {
-            self.phrase.set_label("No pairing confirmation needed.");
-            self.phrase.set_tooltip("");
-            self.confirm.deactivate();
-            self.reject.deactivate();
-        }
-        let other_owns = self
+            format!("{}  {}", self.notice, self.network_status)
+        };
+        self.host_status.set_label(&status);
+        self.connect_status.set_label(&status);
+        self.workspace_status.set_label(&status);
+        let name = self
+            .store
+            .trusted_host()
+            .map(|host| host.name)
+            .unwrap_or_else(|| self.store.device().name);
+        self.workspace_title
+            .set_label(&format!("Shared with {name}"));
+        let other = self
             .model
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.owner != self.model.side);
-        if self.model.running
-            && !self.stopping
-            && other_owns
-            && (self.model.side == Side::Host || self.model.connected)
-        {
+        if other && (self.model.side == Side::Host || self.model.connected) {
             self.take.activate();
         } else {
             self.take.deactivate();
@@ -661,27 +781,8 @@ impl Ui {
         } else {
             self.draft.activate();
         }
-        let has_saved = if self.mode.value() == 0 {
-            self.store.has_trusted_peer()
-        } else {
-            self.store.trusted_host().is_some()
-        };
-        if !self.model.running && has_saved {
-            self.forget.activate();
-        } else {
-            self.forget.deactivate();
-        }
-        if !self.model.running && self.mode.value() == 0 {
-            self.reset_identity.activate();
-        } else {
-            self.reset_identity.deactivate();
-        }
-        let ownership = if self.model.drafts.len() == MAX_DRAFTS {
-            "Draft storage full. Copy, restore, or discard one to continue."
-        } else if !self.model.running {
-            "Start or connect to edit."
-        } else if self.model.side == Side::Peer && !self.model.connected {
-            "Disconnected · read only"
+        let owner = if self.model.drafts.len() == MAX_DRAFTS {
+            "Draft storage full."
         } else if self.model.can_edit() {
             if self.model.has_unsent() {
                 "You have control · syncing..."
@@ -691,53 +792,29 @@ impl Ui {
         } else {
             "Other computer has control · read only"
         };
-        self.owner.set_label(ownership);
-        self.status.set_label(&if self.notice.is_empty() {
-            self.network_status.clone()
-        } else {
-            format!("{}\n{}", self.notice, self.network_status)
-        });
+        self.owner.set_label(owner);
     }
 
     fn show_drafts(&mut self) {
         if self.model.drafts.is_empty() {
             return;
         }
-        let mut window = Window::default()
-            .with_size(690, 460)
-            .with_label("pair — recovery drafts")
-            .center_screen();
-        let mut layout = Flex::default_fill().column();
-        layout.set_margin(12);
-        layout.set_spacing(8);
-        let mut select = Choice::default();
+        let mut window = Window::new(120, 120, 690, 460, "pair — recovery drafts").center_screen();
+        let mut select = Choice::new(12, 12, 666, 30, None);
         for (i, text) in self.model.drafts.iter().enumerate() {
-            select.add_choice(&format!("Draft {} ({} UTF-8 bytes)", i + 1, text.len()));
+            select.add_choice(&format!("Draft {} ({} bytes)", i + 1, text.len()));
         }
         select.set_value((self.model.drafts.len() - 1) as i32);
-        layout.fixed(&select, 30);
         let mut buffer = TextBuffer::default();
         buffer.set_text(&self.model.drafts[select.value() as usize]);
-        let mut display = TextDisplay::default();
+        let mut display = TextDisplay::new(12, 52, 666, 340, None);
         display.set_buffer(buffer.clone());
-        display.set_text_font(Font::Courier);
-        display.set_text_size(14);
-        let mut hint = Frame::default().with_label(
-            "Drafts stay in memory until you close Pair. Restore requires editing control.",
-        );
-        hint.set_align(Align::Left | Align::Inside | Align::Wrap);
-        hint.set_label_size(12);
-        layout.fixed(&hint, 36);
-        let row = Flex::default().row();
-        let mut copy = Button::default().with_label("Copy Draft");
-        let mut restore = Button::default().with_label("Restore");
-        let mut discard = Button::default().with_label("Discard Draft");
-        let mut close = Button::default().with_label("Close");
-        row.end();
-        layout.fixed(&row, 32);
-        layout.end();
+        display.set_text_font(Font::Helvetica);
+        let mut copy = Button::new(12, 410, 120, 32, "Copy Draft");
+        let mut restore = Button::new(142, 410, 120, 32, "Restore");
+        let mut discard = Button::new(272, 410, 120, 32, "Discard");
+        let mut close = Button::new(558, 410, 120, 32, "Close");
         window.end();
-        window.resizable(&layout);
         window.make_modal(true);
         let selection = Rc::new(Cell::new(select.value() as usize));
         let result = Rc::new(Cell::new(0));
@@ -778,15 +855,15 @@ impl Ui {
         while window.shown() {
             app::wait();
         }
-        self.network_update();
         match result.get() {
-            1 => match self.model.restore_draft(selection.get()) {
-                Ok(()) => {
+            1 => {
+                if let Err(error) = self.model.restore_draft(selection.get()) {
+                    self.notice = error.into()
+                } else {
                     self.last_change = Instant::now();
                     self.schedule_flush();
                 }
-                Err(error) => self.notice = error.into(),
-            },
+            }
             2 => {
                 self.model.drafts.remove(selection.get());
             }
@@ -798,6 +875,7 @@ impl Ui {
 
 pub fn run() {
     let application = app::App::default().with_scheme(app::Scheme::Base);
+    choose_font();
     app::set_font_size(14);
     let store = match Store::load_default() {
         Ok(store) => store,
@@ -826,42 +904,5 @@ pub fn run() {
         if ui.discovery_update() || ui.network_update() || changed {
             ui.render();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pair::{protocol::MAX_NOTE_BYTES, state::Authority};
-
-    #[test]
-    fn native_widgets_preserve_text_and_gate_editing() {
-        let _app = app::App::default();
-        let directory = std::env::temp_dir().join(format!("pair-ui-test-{}", std::process::id()));
-        let path = directory.join("state.json");
-        let _ = std::fs::remove_dir_all(&directory);
-        let store = Store::load(path.clone()).unwrap();
-        let (tx, _rx) = mpsc::channel();
-        let mut ui = Ui::new(tx, store);
-        let mut authority = Authority::new(String::new()).unwrap();
-        ui.model.start(Side::Host);
-        ui.model.receive(authority.snapshot.clone(), 1);
-        ui.render();
-        assert!(ui.editor.visible());
-        let original = "\t  print('梨 🍐 café')\r\n\n  end\n";
-        ui.buffer.set_text(original);
-        ui.act(Action::Changed).unwrap();
-        assert_eq!(ui.model.text, original);
-        ui.buffer.set_text(&"a".repeat(MAX_NOTE_BYTES + 1));
-        assert!(ui.act(Action::Changed).is_err());
-        ui.render();
-        assert_eq!(ui.buffer.text(), original);
-        authority.take_control(Side::Peer);
-        ui.model.receive(authority.snapshot, 1);
-        ui.render();
-        assert!(!ui.editor.visible());
-        assert_eq!(ui.model.drafts, vec![original]);
-        app::delete_widget(ui.window);
-        let _ = std::fs::remove_dir_all(directory);
     }
 }

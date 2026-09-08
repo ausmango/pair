@@ -32,22 +32,24 @@ you can open it from the Applications menu.
 
 ## Use Pair
 
-1. Open Pair on both computers. Give each one a useful device name.
-2. On one computer, leave **Host** selected and click **Start Host**. On the
-   other, select **Connect**, choose the nearby host, and click **Connect**.
+1. Open Pair on both computers. Choose **Host** on the computer sharing the
+   note; it starts advertising immediately.
+2. Choose **Connect** on the other computer, select the host under **Nearby**,
+   and click **Connect**. IP addresses and ports stay hidden during normal use.
 3. Compare the six-word phrase on both screens. If it matches exactly, click
    **Phrase Matches — Pair** on both computers.
 
-Pair remembers the verified device. Later connections need one click and use
-the saved certificate pin and random reconnect token.
+Pair remembers the verified device. A host can remember eight computers while
+keeping one active session. Later connections need one click and use the saved
+certificate pin and a per-device reconnect token.
 
 The host starts with editing control. Click **Take Control** on the other
 computer before editing there. **Copy All** copies the complete note. Tabs,
 indentation, Unicode, and line breaks are preserved.
 
-If the host does not appear, enter its LAN IP and port manually. The default
-port is `47321`. Discovery uses IPv4 multicast DNS; manual IPv4 and IPv6
-connections remain available.
+If the host does not appear, open **Can't find your computer?** for Refresh,
+connection help, and manual IP/port entry. The default port is `47321`. Pair
+tries available Wi-Fi, routed Ethernet, and direct-Ethernet addresses.
 
 ## Privacy and security
 

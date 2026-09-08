@@ -15,10 +15,12 @@ stable DNS identity.
 4. Both devices display six code words derived from 48 bits of the SHA-256 host
    certificate fingerprint. Users must compare the phrases through direct
    visual inspection and confirm on both devices.
-5. The host saves a fresh, OS-random 256-bit token before transmitting it over
-   the verified TLS session. The client saves the token and exact certificate
-   fingerprint, closes the provisional session, and reconnects.
-6. The normal connection succeeds only after exact certificate pinning, TLS
+5. The host sends a temporary, OS-random 256-bit token. The client atomically
+   saves that token and the exact certificate fingerprint, then acknowledges
+   the save. Only then does the host save or replace that peer and complete
+   pairing. An interrupted attempt before the acknowledgement consumes no slot.
+6. Both sides close the provisional session. The normal connection succeeds
+   only after exact certificate pinning, TLS
    handshake-signature verification, and constant-time token authentication.
 
 A machine-in-the-middle that terminates TLS presents a different certificate
@@ -29,10 +31,10 @@ labels, not trust anchors.
 ## Later connections
 
 The client pins the saved SHA-256 certificate fingerprint. A changed
-certificate is rejected without a bypass. The host admits only the holder of
-the saved random token and only one peer at a time. **Forget Device** rotates the
-host token or removes the client pin. **Reset Identity** replaces the host
-certificate and private key and revokes its paired peer.
+certificate is rejected without a bypass. A host stores up to eight independent
+peer tokens and admits only one peer at a time. Removing a paired device revokes
+only its token. **Reset Identity** replaces the host certificate and private key
+and revokes every paired peer.
 
 ## Stored data
 
