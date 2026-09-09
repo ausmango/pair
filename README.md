@@ -47,7 +47,7 @@ The host starts with editing control. Click **Take Control** on the other
 computer before editing there. **Copy All** copies the complete note. Tabs,
 indentation, Unicode, and line breaks are preserved.
 
-If the host does not appear, open **Can't find your computer?** for Refresh,
+If the host does not appear, open **Connection help...** for Refresh,
 connection help, and manual IP/port entry. The default port is `47321`. Pair
 tries available Wi-Fi, routed Ethernet, and direct-Ethernet addresses.
 

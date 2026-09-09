@@ -105,7 +105,7 @@ jobs:
             <key>CFBundleName</key><string>Pair</string>
             <key>CFBundleIconFile</key><string>pair</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>CFBundleShortVersionString</key><string>0.4.0</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSLocalNetworkUsageDescription</key>
             <string>Pair finds and connects to another computer on your local network.</string>
@@ -141,4 +141,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "pair $GITHUB_REF_NAME" \
-            --notes "Pair v0.3.0 introduces a role-first Connect/Host interface and more reliable local connectivity. Nearby hosts can advertise multiple Wi-Fi, routed-Ethernet, and direct-Ethernet addresses; Pair tries the last working route first and reconnects faster. Hosts can remember up to eight computers with independent tokens, and the completed pairing handshake prevents interrupted attempts from consuming trust. macOS bundles now declare Bonjour and Local Network access. Protocol v3 requires both computers to update. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
+            --notes "Pair v0.4.0 improves local connection reliability and restores the retro Pair interface. Pair keeps multiple Wi-Fi, routed-Ethernet, and direct-Ethernet candidates, tries the last working route first, reports connection progress and actionable diagnostics, and avoids replacing a saved route after failed authentication. Pairing repair and reconnect behavior remain protected by the existing verified-device flow. Protocol v3 is unchanged. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
