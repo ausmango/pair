@@ -10,11 +10,11 @@ use fltk::{
     app,
     button::Button,
     dialog, draw,
-    enums::{Align, Color, Font, FrameType},
+    enums::{Align, Color, Font, FrameType, Shortcut},
     frame::Frame,
     group::Group,
     input::Input,
-    menu::Choice,
+    menu::{Choice, MenuBar},
     prelude::*,
     text::{TextBuffer, TextDisplay, TextEditor},
     window::Window,
@@ -29,7 +29,15 @@ use pair::{
 
 const DEBOUNCE: Duration = Duration::from_millis(20);
 const PORT: &str = "47321";
-const BG: Color = Color::from_rgb(243, 243, 241);
+const BG: Color = Color::from_rgb(238, 237, 231);
+const PANEL: Color = Color::from_rgb(202, 201, 194);
+const FIELD: Color = Color::from_rgb(248, 247, 242);
+const GREEN: Color = Color::from_rgb(36, 122, 69);
+const MARGIN: i32 = 16;
+const MENU_H: i32 = 24;
+const STATUS_H: i32 = 28;
+const LANDING_INSET: i32 = 135;
+const CARD_GAP: i32 = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -119,10 +127,32 @@ fn callback(button: &mut Button, tx: &mpsc::Sender<Action>, action: fn() -> Acti
         let _ = tx.send(action());
     });
 }
-fn flat(button: &mut Button) {
-    button.set_frame(FrameType::FlatBox);
-    button.set_color(Color::White);
-    button.set_selection_color(Color::from_rgb(118, 190, 92));
+fn button_style(button: &mut Button, primary: bool) {
+    button.set_frame(FrameType::UpBox);
+    button.set_color(if primary {
+        Color::from_rgb(224, 230, 218)
+    } else {
+        PANEL
+    });
+    button.set_label_color(Color::Black);
+    button.set_selection_color(GREEN);
+    button.set_label_size(13);
+}
+fn field_style<W: WidgetExt>(widget: &mut W) {
+    widget.set_frame(FrameType::DownBox);
+    widget.set_color(FIELD);
+    widget.set_label_color(Color::from_rgb(65, 65, 62));
+}
+fn recessed(mut frame: Frame) -> Frame {
+    frame.set_frame(FrameType::DownBox);
+    frame.set_color(FIELD);
+    frame.set_label_color(Color::from_rgb(65, 65, 62));
+    frame
+}
+fn panel(mut group: Group) -> Group {
+    group.set_frame(FrameType::EngravedBox);
+    group.set_color(PANEL);
+    group
 }
 fn heading(mut frame: Frame, text: &str, size: i32) {
     frame.set_label(text);
@@ -131,16 +161,18 @@ fn heading(mut frame: Frame, text: &str, size: i32) {
 }
 fn icon(mut frame: Frame, host: bool) {
     frame.draw(move |f| {
-        draw::set_draw_color(Color::Black);
-        let (x, y, w, h) = (f.x(), f.y(), f.w(), f.h());
+        draw::set_draw_color(Color::from_rgb(45, 45, 42));
+        let (x, y, w) = (f.x(), f.y(), f.w());
         if host {
-            draw::draw_pie(x + w / 2 - 27, y + 8, 54, 54, 0., 360.);
-            draw::draw_pie(x + w / 2 - 50, y + 58, 100, 76, 0., 180.);
+            draw::draw_pie(x + w / 2 - 11, y + 10, 22, 22, 0., 360.);
+            draw::draw_arc(x + w / 2 - 31, y + 29, 62, 48, 180., 360.);
+            draw::draw_line(x + w / 2 - 31, y + 53, x + w / 2 + 31, y + 53);
         } else {
-            draw::draw_rect(x + 25, y + 15, w - 50, h - 58);
-            draw::draw_rect(x + 12, y + h - 35, w - 24, 24);
-            draw::draw_rectf(x + 25, y + h - 27, w / 2, 7);
-            draw::draw_pie(x + w - 38, y + h - 30, 12, 12, 0., 360.);
+            let sw = 58;
+            draw::draw_rect(x + (w - sw) / 2, y + 11, sw, 39);
+            draw::draw_rectf(x + (w - 22) / 2, y + 21, 22, 15);
+            draw::draw_line(x + w / 2, y + 50, x + w / 2, y + 59);
+            draw::draw_line(x + w / 2 - 18, y + 59, x + w / 2 + 18, y + 59);
         }
     });
 }
@@ -166,26 +198,77 @@ impl Ui {
         let device = store.device();
         let mut window = Window::new(100, 100, 900, 650, "pair").center_screen();
         window.set_color(BG);
-        window.size_range(760, 560, 0, 0);
+        window.size_range(800, 600, 0, 0);
+        let card_w = (window.w() - 2 * LANDING_INSET - CARD_GAP) / 2;
+        let connect_x = (window.w() - (2 * card_w + CARD_GAP)) / 2;
+        let host_x = connect_x + card_w + CARD_GAP;
 
         let landing = Group::new(0, 0, 900, 650, None);
-        heading(
-            Frame::new(0, 52, 900, 52, None),
-            "How do you want to pair?",
-            30,
+        let mut menu = MenuBar::new(0, 0, 900, MENU_H, None);
+        menu.add("File", Shortcut::None, fltk::menu::MenuFlag::Normal, |_| {});
+        menu.add(
+            "Connection",
+            Shortcut::None,
+            fltk::menu::MenuFlag::Normal,
+            |_| {},
         );
-        heading(Frame::new(130, 130, 270, 54, None), "Connect", 42);
-        icon(Frame::new(185, 195, 160, 150, None), false);
-        let mut open_connect = Button::new(145, 370, 240, 58, "Connect to a computer");
-        flat(&mut open_connect);
-        heading(Frame::new(500, 130, 270, 54, None), "Host", 42);
-        icon(Frame::new(555, 195, 160, 150, None), true);
-        let mut open_host = Button::new(515, 370, 240, 58, "Share from this computer");
-        flat(&mut open_host);
-        let mut wordmark = Frame::new(18, 598, 180, 30, "pair");
+        menu.add("Help", Shortcut::None, fltk::menu::MenuFlag::Normal, |_| {});
+        menu.set_frame(FrameType::UpBox);
+        menu.set_color(PANEL);
+        heading(
+            Frame::new(0, 72, 900, 38, None),
+            "How do you want to pair?",
+            22,
+        );
+        // These cards use the same width and a single centered gutter at the default size.
+        let connect_card = panel(Group::new(connect_x, 135, card_w, 330, None));
+        heading(
+            Frame::new(connect_x + MARGIN, 150, card_w - 2 * MARGIN, 30, None),
+            "Connect",
+            19,
+        );
+        icon(
+            Frame::new(connect_x + 60, 191, card_w - 120, 72, None),
+            false,
+        );
+        let mut connect_description = Frame::new(
+            connect_x + MARGIN,
+            280,
+            card_w - 2 * MARGIN,
+            24,
+            "Join another computer",
+        );
+        connect_description.set_align(Align::Center | Align::Inside);
+        connect_description.set_label_color(Color::from_rgb(72, 72, 68));
+        let mut open_connect = Button::new(connect_x + 52, 340, card_w - 104, 38, "Connect");
+        button_style(&mut open_connect, true);
+        connect_card.end();
+        let host_card = panel(Group::new(host_x, 135, card_w, 330, None));
+        heading(
+            Frame::new(host_x + MARGIN, 150, card_w - 2 * MARGIN, 30, None),
+            "Host",
+            19,
+        );
+        icon(Frame::new(host_x + 60, 191, card_w - 120, 72, None), true);
+        let mut host_description = Frame::new(
+            host_x + MARGIN,
+            280,
+            card_w - 2 * MARGIN,
+            24,
+            "Share from this computer",
+        );
+        host_description.set_align(Align::Center | Align::Inside);
+        host_description.set_label_color(Color::from_rgb(72, 72, 68));
+        let mut open_host = Button::new(host_x + 52, 340, card_w - 104, 38, "Host");
+        button_style(&mut open_host, true);
+        host_card.end();
+        let mut landing_status = recessed(Frame::new(0, 622, 900, STATUS_H, "●  Ready"));
+        landing_status.set_label_color(GREEN);
+        landing_status.set_align(Align::Left | Align::Inside);
+        let mut wordmark = Frame::new(MARGIN, 586, 180, 24, "pair");
         wordmark.set_label_size(24);
         wordmark.set_align(Align::Left | Align::Inside);
-        let mut version = Frame::new(750, 598, 132, 30, None);
+        let mut version = Frame::new(750, 626, 132, 20, None);
         version.set_label(&format!("v{}", env!("CARGO_PKG_VERSION")));
         version.set_align(Align::Right | Align::Inside);
         landing.end();
@@ -194,31 +277,34 @@ impl Ui {
         heading(Frame::new(0, 35, 900, 45, None), "Host a note", 30);
         let mut host_name = Input::new(285, 105, 330, 36, "This computer  ");
         host_name.set_value(&device.name);
+        field_style(&mut host_name);
         let mut save_name = Button::new(625, 105, 95, 36, "Save name");
-        flat(&mut save_name);
-        let mut host_status = Frame::new(130, 165, 640, 55, "Starting host...");
+        button_style(&mut save_name, false);
+        let mut host_status = recessed(Frame::new(130, 165, 640, 55, "Starting host..."));
         host_status.set_align(Align::Center | Align::Inside | Align::Wrap);
-        let mut host_phrase = Frame::new(120, 225, 660, 82, "Waiting for a computer...");
+        let mut host_phrase = recessed(Frame::new(120, 225, 660, 82, "Waiting for a computer..."));
         host_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
         host_phrase.set_label_size(15);
         let mut host_confirm = Button::new(265, 318, 240, 38, "Phrase Matches — Pair");
-        flat(&mut host_confirm);
+        button_style(&mut host_confirm, true);
         let mut host_reject = Button::new(515, 318, 105, 38, "Reject");
-        flat(&mut host_reject);
-        let peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
+        button_style(&mut host_reject, false);
+        let mut peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
+        field_style(&mut peers);
         let mut remove_peer = Button::new(595, 390, 125, 34, "Remove");
-        flat(&mut remove_peer);
-        let mut toggle_host_advanced = Button::new(365, 440, 170, 32, "Advanced settings");
-        flat(&mut toggle_host_advanced);
+        button_style(&mut remove_peer, false);
+        let mut toggle_host_advanced = Button::new(350, 440, 200, 32, "Connection help...");
+        button_style(&mut toggle_host_advanced, false);
         let mut host_advanced = Group::new(250, 482, 450, 45, None);
         let mut host_port = Input::new(330, 488, 100, 32, "Port  ");
         host_port.set_value(PORT);
+        field_style(&mut host_port);
         let mut reset = Button::new(450, 488, 145, 32, "Reset identity");
-        flat(&mut reset);
+        button_style(&mut reset, false);
         host_advanced.end();
         host_advanced.hide();
-        let mut host_back = Button::new(25, 585, 110, 38, "Back / Stop");
-        flat(&mut host_back);
+        let mut host_back = Button::new(25, 585, 90, 38, "Stop");
+        button_style(&mut host_back, false);
         host.end();
         host.hide();
 
@@ -226,33 +312,49 @@ impl Ui {
         heading(Frame::new(0, 35, 900, 45, None), "Connect to a note", 30);
         let mut connect_name = Input::new(285, 82, 300, 30, "This computer  ");
         connect_name.set_value(&device.name);
+        field_style(&mut connect_name);
         let mut save_connect_name = Button::new(595, 82, 95, 30, "Save name");
-        flat(&mut save_connect_name);
-        let nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
+        button_style(&mut save_connect_name, false);
+        let mut nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
+        field_style(&mut nearby);
         let mut connect_button = Button::new(380, 177, 180, 40, "Connect");
-        flat(&mut connect_button);
-        let mut connect_status = Frame::new(120, 220, 660, 56, "Searching for nearby computers...");
+        button_style(&mut connect_button, true);
+        let mut connect_status = recessed(Frame::new(
+            120,
+            220,
+            660,
+            56,
+            "Searching for nearby computers...",
+        ));
         connect_status.set_align(Align::Center | Align::Inside | Align::Wrap);
-        let mut connect_phrase = Frame::new(120, 280, 660, 82, "Select a computer to connect.");
+        let mut connect_phrase = recessed(Frame::new(
+            120,
+            280,
+            660,
+            82,
+            "Select a computer to connect.",
+        ));
         connect_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
         connect_phrase.set_label_size(15);
         let mut connect_confirm = Button::new(265, 372, 240, 38, "Phrase Matches — Pair");
-        flat(&mut connect_confirm);
+        button_style(&mut connect_confirm, true);
         let mut connect_reject = Button::new(515, 372, 105, 38, "Reject");
-        flat(&mut connect_reject);
-        let mut toggle_help = Button::new(325, 442, 250, 34, "Can't find your computer?");
-        flat(&mut toggle_help);
+        button_style(&mut connect_reject, false);
+        let mut toggle_help = Button::new(325, 442, 250, 34, "Connection help...");
+        button_style(&mut toggle_help, false);
         let mut help_group = Group::new(175, 485, 550, 105, None);
         let mut manual_ip = Input::new(225, 492, 205, 32, "IP  ");
         manual_ip.set_value("192.168.1.2");
+        field_style(&mut manual_ip);
         let mut manual_port = Input::new(490, 492, 80, 32, "Port  ");
         manual_port.set_value(PORT);
+        field_style(&mut manual_port);
         let mut manual_connect = Button::new(580, 492, 115, 32, "Connect");
-        flat(&mut manual_connect);
+        button_style(&mut manual_connect, true);
         let mut refresh = Button::new(225, 538, 105, 30, "Refresh");
-        flat(&mut refresh);
+        button_style(&mut refresh, false);
         let mut forget_host = Button::new(340, 538, 135, 30, "Forget host");
-        flat(&mut forget_host);
+        button_style(&mut forget_host, false);
         let mut help = Frame::new(
             485,
             532,
@@ -265,7 +367,7 @@ impl Ui {
         help_group.end();
         help_group.hide();
         let mut connect_back = Button::new(25, 585, 90, 38, "Back");
-        flat(&mut connect_back);
+        button_style(&mut connect_back, false);
         connect.end();
         connect.hide();
 
@@ -273,17 +375,17 @@ impl Ui {
         let mut workspace_title = Frame::new(16, 12, 220, 34, "Shared note");
         workspace_title.set_align(Align::Left | Align::Inside);
         workspace_title.set_label_size(20);
-        let mut workspace_status = Frame::new(235, 12, 235, 34, "Connecting...");
+        let mut workspace_status = recessed(Frame::new(235, 12, 235, 34, "Connecting..."));
         workspace_status.set_align(Align::Left | Align::Inside | Align::Wrap);
         workspace_status.set_label_size(11);
         let mut take = Button::new(480, 12, 115, 34, "Take Control");
-        flat(&mut take);
+        button_style(&mut take, true);
         let mut copy = Button::new(603, 12, 82, 34, "Copy All");
-        flat(&mut copy);
+        button_style(&mut copy, false);
         let mut draft = Button::new(693, 12, 100, 34, "Drafts (0)");
-        flat(&mut draft);
+        button_style(&mut draft, false);
         let mut disconnect = Button::new(801, 12, 82, 34, "Disconnect");
-        flat(&mut disconnect);
+        button_style(&mut disconnect, false);
         let area = Group::new(16, 56, 868, 535, None);
         let mut buffer = TextBuffer::default();
         buffer.set_tab_distance(4);
@@ -292,15 +394,17 @@ impl Ui {
         viewer.set_text_font(Font::Helvetica);
         viewer.set_text_size(15);
         viewer.set_frame(FrameType::DownBox);
+        viewer.set_color(FIELD);
         let mut editor = TextEditor::new(16, 56, 868, 535, None);
         editor.set_buffer(buffer.clone());
         editor.set_text_font(Font::Helvetica);
         editor.set_text_size(15);
         editor.set_frame(FrameType::DownBox);
+        editor.set_color(FIELD);
         editor.set_tab_nav(false);
         editor.hide();
         area.end();
-        let mut owner = Frame::new(16, 598, 868, 34, "Connecting...");
+        let mut owner = recessed(Frame::new(16, 598, 868, 34, "●  Connecting..."));
         owner.set_align(Align::Left | Align::Inside);
         workspace.end();
         workspace.hide();
@@ -469,6 +573,9 @@ impl Ui {
     }
     fn refresh_discovery(&mut self) {
         self.discovery = None;
+        if self.screen == Screen::Connect && self.network.is_none() {
+            self.network_status = "Searching nearby".into();
+        }
         match DiscoveryBrowser::start(app::awake) {
             Ok(browser) => self.discovery = Some(browser),
             Err(error) => self.notice = error,
@@ -534,6 +641,12 @@ impl Ui {
         } else {
             self.nearby.activate();
             self.nearby.set_value(0);
+            if self.network.is_none() {
+                self.network_status = format!(
+                    "Found {}",
+                    self.targets[0].name.as_deref().unwrap_or("host")
+                );
+            }
         }
         true
     }
@@ -726,6 +839,13 @@ impl Ui {
             self.model.receive(snapshot, view.sync_serial);
         }
         self.pairing = view.pairing;
+        if self.pairing.is_some() && self.screen == Screen::Workspace {
+            self.show(if self.model.side == Side::Host {
+                Screen::Host
+            } else {
+                Screen::Connect
+            });
+        }
         self.network_status = view.status;
         if self.model.drafts.len() > drafts {
             self.notice = "Unsent local text was kept in Drafts.".into();
@@ -776,9 +896,18 @@ impl Ui {
             .as_ref()
             .is_some_and(|prompt| !prompt.local_confirmed);
         if confirm {
+            let label = if self.pairing.as_ref().is_some_and(|prompt| prompt.repairing) {
+                "Repair Pairing"
+            } else {
+                "Phrase Matches — Pair"
+            };
+            self.host_confirm.set_label(label);
+            self.connect_confirm.set_label(label);
             self.host_confirm.activate();
             self.connect_confirm.activate();
         } else {
+            self.host_confirm.set_label("Phrase Matches — Pair");
+            self.connect_confirm.set_label("Phrase Matches — Pair");
             self.host_confirm.deactivate();
             self.connect_confirm.deactivate();
         }
@@ -832,7 +961,15 @@ impl Ui {
         } else {
             "Other computer has control · read only"
         };
-        self.owner.set_label(owner);
+        self.owner.set_label(&format!(
+            "{}  {owner}",
+            if self.model.connected { "●" } else { "○" }
+        ));
+        self.owner.set_label_color(if self.model.connected {
+            GREEN
+        } else {
+            Color::from_rgb(65, 65, 62)
+        });
     }
 
     fn show_drafts(&mut self) {
