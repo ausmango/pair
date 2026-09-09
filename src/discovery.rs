@@ -43,15 +43,10 @@ impl DiscoveryCatalog {
         id: &str,
         name: &str,
         address: SocketAddr,
-        version: u32,
+        _version: u32,
         now: Instant,
     ) -> bool {
-        if version != VERSION
-            || !valid_id(id)
-            || !valid_name(name)
-            || !valid_address(address)
-            || address.port() == 0
-        {
+        if !valid_id(id) || !valid_name(name) || !valid_address(address) || address.port() == 0 {
             return false;
         }
         if !self.entries.contains_key(&fullname) && self.entries.len() >= MAX_DISCOVERED {
@@ -61,13 +56,17 @@ impl DiscoveryCatalog {
             if entry.device.id != id {
                 return false;
             }
+            let mut changed = entry.device.name != name;
             entry.device.name = name.into();
             entry.seen = now;
-            if !entry.device.addresses.contains(&address)
-                && entry.device.addresses.len() < MAX_ADDRESSES_PER_DEVICE
-            {
+            if !entry.device.addresses.contains(&address) {
+                if entry.device.addresses.len() == MAX_ADDRESSES_PER_DEVICE {
+                    entry.device.addresses.remove(0);
+                }
                 entry.device.addresses.push(address);
+                changed = true;
             }
+            changed
         } else {
             self.entries.insert(
                 fullname,
@@ -80,8 +79,8 @@ impl DiscoveryCatalog {
                     seen: now,
                 },
             );
+            true
         }
-        true
     }
 
     pub fn remove(&mut self, fullname: &str) -> bool {
@@ -124,6 +123,7 @@ fn valid_address(address: SocketAddr) -> bool {
         && !address.ip().is_loopback()
         && !address.ip().is_unspecified()
         && !address.ip().is_multicast()
+        && !matches!(address.ip(), IpAddr::V4(ip) if ip.is_broadcast())
 }
 
 fn valid_id(value: &str) -> bool {

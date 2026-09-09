@@ -32,9 +32,46 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(5);
-const CONNECT_BUDGET: Duration = Duration::from_secs(3);
+const CONNECT_BUDGET: Duration = Duration::from_secs(7);
 const ADDRESS_ATTEMPT: Duration = Duration::from_millis(750);
-const MAX_ADDRESSES: usize = 8;
+const MAX_ADDRESSES: usize = 9; // Eight discovered addresses plus the saved address.
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn every_bounded_candidate_gets_an_attempt() {
+        assert!(CONNECT_BUDGET >= ADDRESS_ATTEMPT * MAX_ADDRESSES as u32);
+        let mut addresses = (1..=100)
+            .map(|port| SocketAddr::from(([192, 168, 1, 8], port)))
+            .collect();
+        normalize_addresses(&mut addresses);
+        assert_eq!(addresses.len(), MAX_ADDRESSES);
+    }
+
+    #[tokio::test]
+    async fn closed_tls_socket_is_reachability_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            drop(listener.accept().await.unwrap());
+        });
+        let (tx, _) = watch::channel(View::default());
+        let mut publisher = Publisher {
+            tx,
+            view: View::default(),
+            wake: Arc::new(|| {}),
+        };
+        let pairing = Identity::generate().unwrap().pairing;
+        let result = connect_authenticated_candidate(address, &pairing, &mut publisher).await;
+        assert!(matches!(
+            result,
+            Err(AuthenticatedAttemptError::Unreachable)
+        ));
+        server.await.unwrap();
+    }
+}
 
 #[derive(Clone)]
 pub struct ConnectTarget {
@@ -49,12 +86,15 @@ pub fn ordered_addresses(
     discovered: impl IntoIterator<Item = SocketAddr>,
 ) -> Vec<SocketAddr> {
     let mut addresses = Vec::new();
-    if let Some(address) = last_successful {
+    if let Some(address) = last_successful.filter(|address| usable_address(*address)) {
         addresses.push(address);
     }
     let mut routed = Vec::new();
     let mut link_local = Vec::new();
     for address in discovered {
+        if !selectable_address(address) {
+            continue;
+        }
         if matches!(address.ip(), IpAddr::V4(ip) if ip.is_link_local()) {
             link_local.push(address);
         } else {
@@ -65,6 +105,18 @@ pub fn ordered_addresses(
     addresses.extend(link_local);
     normalize_addresses(&mut addresses);
     addresses
+}
+
+fn selectable_address(address: SocketAddr) -> bool {
+    matches!(address.ip(), IpAddr::V4(_)) && usable_address(address)
+}
+
+fn usable_address(address: SocketAddr) -> bool {
+    address.port() != 0
+        && !address.ip().is_loopback()
+        && !address.ip().is_multicast()
+        && !address.ip().is_unspecified()
+        && !matches!(address.ip(), IpAddr::V4(ip) if ip.is_broadcast())
 }
 
 fn normalize_addresses(addresses: &mut Vec<SocketAddr>) {
@@ -84,10 +136,124 @@ fn normalize_addresses(addresses: &mut Vec<SocketAddr>) {
     *addresses = unique;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionProgress {
+    SearchingNearby,
+    FoundDevice(String),
+    TryingLocalNetwork,
+    TryingDirectEthernet,
+    EstablishingSecureConnection,
+    Authenticating,
+    ConnectedSecurely,
+}
+
+impl ConnectionProgress {
+    fn message(&self) -> String {
+        match self {
+            Self::SearchingNearby => "Searching nearby".into(),
+            Self::FoundDevice(name) => format!("Found {name}"),
+            Self::TryingLocalNetwork => "Trying local network".into(),
+            Self::TryingDirectEthernet => "Trying direct Ethernet".into(),
+            Self::EstablishingSecureConnection => "Establishing secure connection".into(),
+            Self::Authenticating => "Authenticating".into(),
+            Self::ConnectedSecurely => "Connected securely".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticOutcome {
+    DeviceNotDiscovered,
+    DeviceFoundUnreachable,
+    FirewallMayBlock,
+    PairingRequired,
+    PairingRequiresRepair,
+    TrustListFull,
+    HostIdentityChanged,
+    VersionsDiffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionDiagnostic {
+    pub outcome: DiagnosticOutcome,
+    pub summary: String,
+    pub action: String,
+}
+
+impl ConnectionDiagnostic {
+    fn new(outcome: DiagnosticOutcome) -> Self {
+        let (summary, action) = match outcome {
+            DiagnosticOutcome::DeviceNotDiscovered => (
+                "Device not discovered",
+                "Keep Pair open on the host, refresh nearby devices, or use Advanced manual connection.",
+            ),
+            DiagnosticOutcome::DeviceFoundUnreachable => (
+                "Device found but unreachable",
+                "Check that both computers are on the same local network or direct Ethernet link.",
+            ),
+            DiagnosticOutcome::FirewallMayBlock => (
+                "Connection may be blocked by firewall",
+                "Allow Pair on private networks on the host, then try again.",
+            ),
+            DiagnosticOutcome::PairingRequired => (
+                "Pairing required",
+                "Compare the phrase on both computers before approving pairing.",
+            ),
+            DiagnosticOutcome::PairingRequiresRepair => (
+                "Pairing requires repair",
+                "Choose Repair Pairing and compare the new phrase on both computers.",
+            ),
+            DiagnosticOutcome::TrustListFull => (
+                "Trusted-device list full",
+                "Remove a paired device on the host, then try again.",
+            ),
+            DiagnosticOutcome::HostIdentityChanged => (
+                "Host identity changed",
+                "Verify the host before forgetting it. Pair will not accept the changed certificate automatically.",
+            ),
+            DiagnosticOutcome::VersionsDiffer => (
+                "Application versions differ",
+                "Install matching Pair versions on both computers.",
+            ),
+        };
+        Self {
+            outcome,
+            summary: summary.into(),
+            action: action.into(),
+        }
+    }
+}
+
+pub fn classify_io_error(kind: io::ErrorKind) -> DiagnosticOutcome {
+    match kind {
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::PermissionDenied => {
+            DiagnosticOutcome::FirewallMayBlock
+        }
+        _ => DiagnosticOutcome::DeviceFoundUnreachable,
+    }
+}
+
+fn pairing_error_outcome(error: &str) -> DiagnosticOutcome {
+    if error.contains("trust list full") {
+        DiagnosticOutcome::TrustListFull
+    } else if error.contains("version mismatch") || error.contains("version") {
+        DiagnosticOutcome::VersionsDiffer
+    } else if error.contains("identity changed") {
+        DiagnosticOutcome::HostIdentityChanged
+    } else if error.contains("repair") {
+        DiagnosticOutcome::PairingRequiresRepair
+    } else if error.contains("refused") || error.contains("firewall") {
+        DiagnosticOutcome::FirewallMayBlock
+    } else if error.contains("timed out") || error.contains("unreachable") {
+        DiagnosticOutcome::DeviceFoundUnreachable
+    } else {
+        DiagnosticOutcome::PairingRequired
+    }
+}
+
 fn prioritize_address(addresses: &mut Vec<SocketAddr>, address: SocketAddr) {
     addresses.retain(|candidate| *candidate != address);
     addresses.insert(0, address);
-    addresses.truncate(MAX_ADDRESSES);
 }
 
 pub enum Mode {
@@ -117,6 +283,7 @@ pub struct PairingPrompt {
     pub other_name: String,
     pub local_confirmed: bool,
     pub peer_confirmed: bool,
+    pub repairing: bool,
 }
 
 #[derive(Clone)]
@@ -128,6 +295,8 @@ pub struct View {
     pub snapshot: Option<Snapshot>,
     pub sync_serial: u64,
     pub pairing: Option<PairingPrompt>,
+    pub progress: Option<ConnectionProgress>,
+    pub diagnostic: Option<ConnectionDiagnostic>,
 }
 
 impl Default for View {
@@ -140,6 +309,8 @@ impl Default for View {
             snapshot: None,
             sync_serial: 0,
             pairing: None,
+            progress: None,
+            diagnostic: None,
         }
     }
 }
@@ -203,6 +374,18 @@ impl Publisher {
     }
     fn prompt(&mut self, prompt: Option<PairingPrompt>) {
         self.view.pairing = prompt;
+        self.publish();
+    }
+    fn progress(&mut self, progress: ConnectionProgress) {
+        self.view.status = progress.message();
+        self.view.progress = Some(progress);
+        self.view.diagnostic = None;
+        self.publish();
+    }
+    fn diagnose(&mut self, outcome: DiagnosticOutcome) {
+        let diagnostic = ConnectionDiagnostic::new(outcome);
+        self.view.status = format!("{}. {}", diagnostic.summary, diagnostic.action);
+        self.view.diagnostic = Some(diagnostic);
         self.publish();
     }
 }
@@ -347,6 +530,8 @@ pub async fn connect_authenticated_first(
 
 async fn connect_provisional_candidates(
     addresses: &[SocketAddr],
+    expected_fingerprint: Option<[u8; 32]>,
+    publisher: &mut Publisher,
 ) -> Result<(TlsStream<TcpStream>, [u8; 32], SocketAddr), String> {
     let started = time::Instant::now();
     let mut last_error = "Device found but unreachable.".to_string();
@@ -355,8 +540,22 @@ async fn connect_provisional_candidates(
         if remaining.is_zero() {
             break;
         }
+        publisher.progress(
+            if matches!(address.ip(), IpAddr::V4(ip) if ip.is_link_local()) {
+                ConnectionProgress::TryingDirectEthernet
+            } else {
+                ConnectionProgress::TryingLocalNetwork
+            },
+        );
+        publisher.progress(ConnectionProgress::EstablishingSecureConnection);
         match timeout(ADDRESS_ATTEMPT.min(remaining), connect_provisional(address)).await {
-            Ok(Ok((stream, fingerprint))) => return Ok((stream, fingerprint, address)),
+            Ok(Ok((stream, fingerprint))) => {
+                if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+                    last_error = "Host identity changed.".into();
+                    continue;
+                }
+                return Ok((stream, fingerprint, address));
+            }
             Ok(Err(error)) => last_error = error,
             Err(_) => {
                 last_error =
@@ -366,6 +565,126 @@ async fn connect_provisional_candidates(
         }
     }
     Err(last_error)
+}
+
+enum AuthenticatedAttemptError {
+    Io(io::ErrorKind),
+    Unreachable,
+    PairingRequiresRepair,
+    HostIdentityChanged,
+    VersionsDiffer,
+}
+
+impl AuthenticatedAttemptError {
+    fn outcome(&self) -> DiagnosticOutcome {
+        match self {
+            Self::Io(kind) => classify_io_error(*kind),
+            Self::Unreachable => DiagnosticOutcome::DeviceFoundUnreachable,
+            Self::PairingRequiresRepair => DiagnosticOutcome::PairingRequiresRepair,
+            Self::HostIdentityChanged => DiagnosticOutcome::HostIdentityChanged,
+            Self::VersionsDiffer => DiagnosticOutcome::VersionsDiffer,
+        }
+    }
+}
+
+async fn connect_authenticated_candidate(
+    address: SocketAddr,
+    pairing: &Pairing,
+    publisher: &mut Publisher,
+) -> Result<(TlsStream<TcpStream>, Snapshot), AuthenticatedAttemptError> {
+    let socket = TcpStream::connect(address)
+        .await
+        .map_err(|error| AuthenticatedAttemptError::Io(error.kind()))?;
+    socket
+        .set_nodelay(true)
+        .map_err(|error| AuthenticatedAttemptError::Io(error.kind()))?;
+    publisher.progress(ConnectionProgress::EstablishingSecureConnection);
+    let name =
+        rustls::pki_types::ServerName::try_from("pair.local").expect("fixed valid server name");
+    let mut stream = TlsConnector::from(client_config(pairing))
+        .connect(name, socket)
+        .await
+        .map_err(|error| {
+            if matches!(error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+                Some(rustls::Error::General(message)) if message == "Host certificate fingerprint changed.")
+            {
+                AuthenticatedAttemptError::HostIdentityChanged
+            } else {
+                AuthenticatedAttemptError::Unreachable
+            }
+        })?;
+    publisher.progress(ConnectionProgress::Authenticating);
+    send(
+        &mut stream,
+        &Message::Hello {
+            version: VERSION,
+            token: pairing.token(),
+        },
+    )
+    .await
+    .map_err(|_| AuthenticatedAttemptError::Unreachable)?;
+    let first = timeout(IO_TIMEOUT, read_frame(&mut stream, MAX_FRAME_BYTES))
+        .await
+        .map_err(|_| AuthenticatedAttemptError::Unreachable)?
+        .map_err(|error| AuthenticatedAttemptError::Io(error.kind()))?;
+    match first {
+        Message::State { snapshot } => Ok((stream.into(), snapshot)),
+        Message::AuthFailed {} => Err(AuthenticatedAttemptError::PairingRequiresRepair),
+        Message::VersionMismatch { .. } => Err(AuthenticatedAttemptError::VersionsDiffer),
+        _ => Err(AuthenticatedAttemptError::PairingRequiresRepair),
+    }
+}
+
+async fn connect_authenticated_candidates(
+    addresses: &[SocketAddr],
+    pairing: &Pairing,
+    publisher: &mut Publisher,
+) -> Result<(TlsStream<TcpStream>, Snapshot, SocketAddr), DiagnosticOutcome> {
+    let started = time::Instant::now();
+    let mut outcome = DiagnosticOutcome::DeviceFoundUnreachable;
+    let mut firewall_likely = false;
+    let mut identity_changed = false;
+    let mut versions_differ = false;
+    for &address in addresses {
+        let remaining = CONNECT_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        publisher.progress(
+            if matches!(address.ip(), IpAddr::V4(ip) if ip.is_link_local()) {
+                ConnectionProgress::TryingDirectEthernet
+            } else {
+                ConnectionProgress::TryingLocalNetwork
+            },
+        );
+        match timeout(
+            ADDRESS_ATTEMPT.min(remaining),
+            connect_authenticated_candidate(address, pairing, publisher),
+        )
+        .await
+        {
+            Ok(Ok((stream, snapshot))) => return Ok((stream, snapshot, address)),
+            Ok(Err(error)) => {
+                outcome = error.outcome();
+                firewall_likely |= outcome == DiagnosticOutcome::FirewallMayBlock;
+                identity_changed |= outcome == DiagnosticOutcome::HostIdentityChanged;
+                versions_differ |= outcome == DiagnosticOutcome::VersionsDiffer;
+                if outcome == DiagnosticOutcome::PairingRequiresRepair {
+                    return Err(outcome);
+                }
+            }
+            Err(_) => outcome = DiagnosticOutcome::DeviceFoundUnreachable,
+        }
+    }
+    Err(if identity_changed {
+        DiagnosticOutcome::HostIdentityChanged
+    } else if versions_differ {
+        DiagnosticOutcome::VersionsDiffer
+    } else if firewall_likely {
+        DiagnosticOutcome::FirewallMayBlock
+    } else {
+        outcome
+    })
 }
 
 struct Reader {
@@ -607,6 +926,10 @@ async fn host_pair_session(
         other_name: peer.name.clone(),
         local_confirmed: false,
         peer_confirmed: false,
+        repairing: store
+            .trusted_peers()
+            .iter()
+            .any(|saved| saved.id == peer.id),
     };
     publisher.view.status =
         "Unverified pairing: compare the phrase on both screens. No note data has been shared."
@@ -649,20 +972,28 @@ async fn run_client(
 ) -> Result<(), String> {
     normalize_addresses(&mut target.addresses);
     if target.addresses.is_empty() {
-        return Err(
-            "Device not discovered. Open Connection help or enter an address under Advanced."
-                .into(),
-        );
+        publisher.progress(ConnectionProgress::SearchingNearby);
+        publisher.diagnose(DiagnosticOutcome::DeviceNotDiscovered);
+        return Err(publisher.view.status.clone());
     }
+    publisher.progress(ConnectionProgress::FoundDevice(
+        target.name.clone().unwrap_or_else(|| "host".into()),
+    ));
     if target.pairing.is_none() {
-        publisher.view.status = "Starting unverified pairing...".into();
-        publisher.publish();
-        let (pairing, id, name, address) = timeout(
+        publisher.diagnose(DiagnosticOutcome::PairingRequired);
+        let paired = timeout(
             PAIR_TIMEOUT,
             client_pair_session(&target, &store, commands, publisher),
         )
         .await
-        .map_err(|_| "Pairing expired after 60 seconds.".to_string())??;
+        .map_err(|_| "Pairing expired after 60 seconds.".to_string())?;
+        let (pairing, id, name, address) = match paired {
+            Ok(paired) => paired,
+            Err(error) => {
+                publisher.diagnose(pairing_error_outcome(&error));
+                return Err(publisher.view.status.clone());
+            }
+        };
         target.pairing = Some(pairing);
         target.id = Some(id);
         target.name = Some(name);
@@ -677,30 +1008,42 @@ async fn run_client(
     let delays = [250, 500, 1_000, 2_000, 5_000];
     let mut retry = 0usize;
     loop {
-        publisher.view.status = "Connecting securely...".into();
-        publisher.publish();
-        let result = match connect_authenticated_first(&target.addresses, &pairing).await {
-            Ok((stream, address)) => {
-                prioritize_address(&mut target.addresses, address);
-                retry = 0;
-                client_session(stream, commands, publisher, &store, address).await
-            }
-            Err(error) => Err(error),
-        };
+        let result: Result<(), DiagnosticOutcome> =
+            match connect_authenticated_candidates(&target.addresses, &pairing, publisher).await {
+                Ok((stream, snapshot, address)) => {
+                    prioritize_address(&mut target.addresses, address);
+                    retry = 0;
+                    if let Err(error) =
+                        client_session(stream, snapshot, commands, publisher, &store, address).await
+                    {
+                        publisher.view.status = format!("{error} Retrying shortly.");
+                        publisher.view.diagnostic = Some(ConnectionDiagnostic::new(
+                            DiagnosticOutcome::DeviceFoundUnreachable,
+                        ));
+                        publisher.publish();
+                    }
+                    Ok(())
+                }
+                Err(outcome) => {
+                    publisher.diagnose(outcome);
+                    Err(outcome)
+                }
+            };
         publisher.view.connected = false;
-        if result
-            .as_ref()
-            .is_err_and(|error| error.contains("Authentication rejected"))
-        {
-            publisher.view.status =
-                "Pairing required or needs repair. Compare a new phrase.".into();
-            publisher.publish();
-            let (new_pairing, id, name, address) = timeout(
+        if result == Err(DiagnosticOutcome::PairingRequiresRepair) {
+            let repaired = timeout(
                 PAIR_TIMEOUT,
                 client_pair_session(&target, &store, commands, publisher),
             )
             .await
-            .map_err(|_| "Repair pairing expired after 60 seconds.".to_string())??;
+            .map_err(|_| "Repair pairing expired after 60 seconds.".to_string())?;
+            let (new_pairing, id, name, address) = match repaired {
+                Ok(repaired) => repaired,
+                Err(error) => {
+                    publisher.diagnose(pairing_error_outcome(&error));
+                    return Err(publisher.view.status.clone());
+                }
+            };
             pairing = new_pairing;
             target.id = Some(id);
             target.name = Some(name);
@@ -709,11 +1052,23 @@ async fn run_client(
             retry = 0;
             continue;
         }
+        if result.as_ref().is_err_and(|outcome| {
+            matches!(
+                outcome,
+                DiagnosticOutcome::HostIdentityChanged | DiagnosticOutcome::VersionsDiffer
+            )
+        }) {
+            return Err(publisher.view.status.clone());
+        }
         let delay = delays[retry.min(delays.len() - 1)];
-        publisher.view.status = format!(
-            "{} Retrying shortly. Open Connection help if this continues.",
-            result.err().unwrap_or_else(|| "Disconnected.".into())
-        );
+        if result.is_ok() {
+            publisher.view.status = "Connection lost. Retrying shortly.".into();
+            publisher.view.diagnostic = Some(ConnectionDiagnostic::new(
+                DiagnosticOutcome::DeviceFoundUnreachable,
+            ));
+        } else {
+            publisher.view.status.push_str(" Retrying shortly.");
+        }
         publisher.publish();
         let sleep = time::sleep(Duration::from_millis(delay));
         tokio::pin!(sleep);
@@ -722,7 +1077,7 @@ async fn run_client(
                 _ = &mut sleep => break,
                 command = commands.recv() => match command {
                     Some(Command::UpdateAddresses(addresses)) => {
-                        for address in addresses { if !target.addresses.contains(&address) { target.addresses.push(address); } }
+                        target.addresses = addresses;
                         normalize_addresses(&mut target.addresses);
                         retry = 0;
                         break;
@@ -742,8 +1097,9 @@ async fn client_pair_session(
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
 ) -> Result<(Pairing, String, String, SocketAddr), String> {
+    let expected_fingerprint = target.pairing.as_ref().map(|saved| saved.fingerprint);
     let (mut stream, fingerprint, address) =
-        connect_provisional_candidates(&target.addresses).await?;
+        connect_provisional_candidates(&target.addresses, expected_fingerprint, publisher).await?;
     let device = store.device();
     send(
         &mut stream,
@@ -784,6 +1140,7 @@ async fn client_pair_session(
         other_name: host_name.clone(),
         local_confirmed: false,
         peer_confirmed: false,
+        repairing: target.pairing.is_some(),
     };
     publisher.view.status =
         "Unverified pairing: compare the phrase on both screens. No note data has been shared."
@@ -801,7 +1158,17 @@ async fn client_pair_session(
                 Message::PairConfirm {} => { prompt.peer_confirmed = true; publisher.prompt(Some(prompt.clone())); }
                 Message::PairGranted { token } if prompt.local_confirmed && prompt.peer_confirmed => {
                     let pairing = Pairing::parse(&format!("pair1:{}:{token}", hex(&fingerprint))).map_err(str::to_string)?;
-                    store.trust_host(host_id.clone(), host_name.clone(), address, pairing.clone())?;
+                    let address_to_store = if target.pairing.is_some() {
+                        store.trusted_host().map_or(address, |saved| saved.address)
+                    } else {
+                        address
+                    };
+                    store.trust_host(
+                        host_id.clone(),
+                        host_name.clone(),
+                        address_to_store,
+                        pairing.clone(),
+                    )?;
                     send(&mut writer, &Message::PairStored {}).await?;
                     match reader.rx.recv().await {
                         Some(Ok(Message::PairComplete {})) => return Ok((pairing, host_id, host_name, address)),
@@ -848,36 +1215,19 @@ async fn host_session(
 }
 
 async fn client_session(
-    mut stream: TlsStream<TcpStream>,
+    stream: TlsStream<TcpStream>,
+    snapshot: Snapshot,
     commands: &mut mpsc::Receiver<Command>,
     publisher: &mut Publisher,
     store: &Store,
     address: SocketAddr,
 ) -> Result<(), String> {
-    let first = timeout(IO_TIMEOUT, read_frame(&mut stream, MAX_FRAME_BYTES))
-        .await
-        .map_err(|_| "Host did not complete authentication.".to_string())?
-        .map_err(io_message)?;
-    let snapshot = match first {
-        Message::State { snapshot } => snapshot,
-        Message::VersionMismatch { expected } => {
-            return Err(format!(
-                "Application version mismatch; host expects protocol {expected}."
-            ));
-        }
-        _ => {
-            return Err(
-                "Authentication rejected. Forget and re-pair only after checking the host.".into(),
-            );
-        }
-    };
     while commands.try_recv().is_ok() {}
     publisher.view.sync_serial += 1;
     publisher.view.snapshot = Some(snapshot);
     publisher.view.connected = true;
     store.update_host_address(address)?;
-    publisher.view.status = "Connected to host (TLS 1.3, pinned certificate).".into();
-    publisher.publish();
+    publisher.progress(ConnectionProgress::ConnectedSecurely);
     let (mut reader, mut writer) = split(stream);
     let mut heartbeat = time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);

@@ -18,7 +18,7 @@ use pair::{
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsStream;
 
@@ -360,6 +360,46 @@ async fn connection_falls_back_to_the_next_available_address() {
     assert_eq!(selected, working_address);
     drop(stream);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_authentication_does_not_replace_the_saved_working_address() {
+    let identity = Identity::generate().unwrap();
+    let stale_pairing = Pairing::new(identity.pairing.fingerprint, [0x55; 32]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let attempted_address = listener.local_addr().unwrap();
+    let saved_address = "192.0.2.10:47321".parse().unwrap();
+    let client_store = store("authenticated-address");
+    client_store
+        .trust_host(
+            "ab".repeat(16),
+            "Host".into(),
+            saved_address,
+            stale_pairing.clone(),
+        )
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        assert!(accept_authenticated(socket, &identity).await.is_err());
+    });
+    let mut client = Network::start(
+        Mode::Connect {
+            target: ConnectTarget {
+                addresses: vec![attempted_address],
+                id: Some("ab".repeat(16)),
+                name: Some("Host".into()),
+                pairing: Some(stale_pairing),
+            },
+            store: client_store.clone(),
+        },
+        || {},
+    )
+    .unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(client_store.trusted_host().unwrap().address, saved_address);
+    client.stop();
+    wait_view(&mut client, |view| !view.running).await;
 }
 
 #[tokio::test]

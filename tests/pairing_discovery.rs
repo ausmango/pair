@@ -7,6 +7,7 @@ use std::{
 
 use pair::{
     discovery::{DiscoveryCatalog, MAX_DISCOVERED},
+    network::{DiagnosticOutcome, classify_io_error, ordered_addresses},
     persistence::{DeviceIdentity, Store, valid_name},
     tls::{Identity, hex, safety_phrase},
 };
@@ -265,6 +266,54 @@ fn discovery_merges_routed_and_direct_ethernet_addresses() {
     let devices = catalog.devices();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].addresses.len(), 2);
+}
+
+#[test]
+fn addresses_rank_last_authenticated_then_routed_then_direct_ethernet() {
+    let saved = "10.0.0.9:47321".parse().unwrap();
+    let routed = "192.168.4.8:47321".parse().unwrap();
+    let direct = "169.254.7.9:47321".parse().unwrap();
+    let addresses = ordered_addresses(
+        Some(saved),
+        [
+            direct,
+            "127.0.0.1:47321".parse().unwrap(),
+            "224.0.0.251:47321".parse().unwrap(),
+            "255.255.255.255:47321".parse().unwrap(),
+            routed,
+            saved,
+        ],
+    );
+    assert_eq!(addresses, vec![saved, routed, direct]);
+}
+
+#[test]
+fn refused_connections_produce_a_firewall_diagnostic() {
+    assert_eq!(
+        classify_io_error(std::io::ErrorKind::ConnectionRefused),
+        DiagnosticOutcome::FirewallMayBlock
+    );
+}
+
+#[test]
+fn discovery_address_churn_is_bounded_and_keeps_new_addresses() {
+    let mut catalog = DiscoveryCatalog::default();
+    for port in 1..=100 {
+        catalog.resolve(
+            "host".into(),
+            &"ab".repeat(16),
+            "Host",
+            SocketAddr::from(([192, 168, 1, 8], port)),
+            3,
+            Instant::now(),
+        );
+    }
+    let devices = catalog.devices();
+    assert_eq!(
+        devices[0].addresses.len(),
+        pair::discovery::MAX_ADDRESSES_PER_DEVICE
+    );
+    assert_eq!(devices[0].addresses.last().unwrap().port(), 100);
 }
 
 #[test]
