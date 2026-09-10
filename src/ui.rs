@@ -857,7 +857,7 @@ impl Ui {
             connect.clone(),
             workspace.clone(),
         ];
-        for (index, screen) in screens.iter_mut().enumerate() {
+        for screen in screens.iter_mut() {
             screen.begin();
             footer(Frame::new(0, 622, 900, STATUS_H, None));
             screen.end();
