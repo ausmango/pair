@@ -105,7 +105,7 @@ jobs:
             <key>CFBundleName</key><string>Pair</string>
             <key>CFBundleIconFile</key><string>pair</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.4.1</string>
+            <key>CFBundleShortVersionString</key><string>0.4.2</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSLocalNetworkUsageDescription</key>
             <string>Pair finds and connects to another computer on your local network.</string>
@@ -141,4 +141,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "pair $GITHUB_REF_NAME" \
-            --notes "Pair v0.4.1 polishes the retro Pair interface. Footer branding is tightened around the Pair wordmark, the footer action/status indicator is removed, and related list, button, icon, and responsive layout corrections are included. Connectivity, pairing, storage, and Protocol v3 are unchanged from v0.4.0. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
+            --notes "Pair v0.4.2 adds an explicit nearby connection flow. Pair now reports Found just now, Checking connection…, Ready to pair, Ready to connect, Found but unreachable, and Offline states; checks reachability before presenting a device confirmation prompt; suppresses duplicate prompts with Not now; and supports retry with refreshed discovered addresses. The retro Pair interface now presents Connect, Reconnect, Details, and keyboard-friendly cancellation during connection attempts. Pairing storage and Protocol v3 are unchanged. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."

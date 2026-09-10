@@ -34,8 +34,10 @@ you can open it from the Applications menu.
 
 1. Open Pair on both computers. Choose **Host** on the computer sharing the
    note; it starts advertising immediately.
-2. Choose **Connect** on the other computer, select the host under **Nearby**,
-   and click **Connect**. IP addresses and ports stay hidden during normal use.
+2. Choose **Connect** on the other computer. Pair checks discovered computers
+   before showing their connection state; select a reachable host under
+   **Nearby** and choose **Connect** or **Reconnect**. IP addresses and ports
+   stay hidden during normal use.
 3. Compare the six-word phrase on both screens. If it matches exactly, click
    **Phrase Matches — Pair** on both computers.
 
