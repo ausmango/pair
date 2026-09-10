@@ -8,13 +8,15 @@ use std::{
 
 use fltk::{
     app,
+    browser::{BrowserScrollbar, HoldBrowser},
     button::Button,
     dialog, draw,
-    enums::{Align, Color, Font, FrameType, Shortcut},
+    enums::{Align, Color, ColorDepth, Damage, Event, Font, FrameType},
     frame::Frame,
     group::Group,
+    image::RgbImage,
     input::Input,
-    menu::{Choice, MenuBar},
+    menu::Choice,
     prelude::*,
     text::{TextBuffer, TextDisplay, TextEditor},
     window::Window,
@@ -30,12 +32,16 @@ use pair::{
 const DEBOUNCE: Duration = Duration::from_millis(20);
 const PORT: &str = "47321";
 const BG: Color = Color::from_rgb(238, 237, 231);
-const PANEL: Color = Color::from_rgb(202, 201, 194);
+const PANEL: Color = Color::from_rgb(212, 211, 205);
 const FIELD: Color = Color::from_rgb(248, 247, 242);
 const GREEN: Color = Color::from_rgb(36, 122, 69);
 const MARGIN: i32 = 16;
-const MENU_H: i32 = 24;
-const STATUS_H: i32 = 28;
+const ROW: i32 = 32;
+const GAP: i32 = 8;
+const STATUS_H: i32 = 24;
+const CONTENT_W: i32 = 640;
+const LIST_H: i32 = 176;
+const SELECTED: Color = Color::from_rgb(230, 240, 223);
 const LANDING_INSET: i32 = 135;
 const CARD_GAP: i32 = 40;
 
@@ -54,6 +60,7 @@ enum Action {
     ConnectNearby,
     ConnectManual,
     Refresh,
+    RefreshHost,
     ToggleHelp,
     ToggleHostAdvanced,
     SaveName,
@@ -86,9 +93,9 @@ struct Ui {
     host_phrase: Frame,
     host_confirm: Button,
     host_reject: Button,
-    peers: Choice,
+    peers: HoldBrowser,
     remove_peer: Button,
-    nearby: Choice,
+    nearby: HoldBrowser,
     connect_name: Input,
     connect_status: Frame,
     connect_phrase: Frame,
@@ -128,15 +135,98 @@ fn callback(button: &mut Button, tx: &mpsc::Sender<Action>, action: fn() -> Acti
     });
 }
 fn button_style(button: &mut Button, primary: bool) {
+    button.super_draw(false);
     button.set_frame(FrameType::UpBox);
-    button.set_color(if primary {
-        Color::from_rgb(224, 230, 218)
+    button.set_color(PANEL);
+    button.set_label_font(if primary {
+        Font::HelveticaBold
     } else {
-        PANEL
+        Font::Helvetica
     });
+    button.set_align(Align::Center | Align::Inside | Align::Clip);
     button.set_label_color(Color::Black);
     button.set_selection_color(GREEN);
-    button.set_label_size(13);
+    button.set_label_size(14);
+    let hover = Rc::new(Cell::new(false));
+    let hover_event = hover.clone();
+    button.handle(move |button, event| {
+        match event {
+            Event::Enter => hover_event.set(true),
+            Event::Leave => hover_event.set(false),
+            _ => return false,
+        }
+        button.redraw();
+        // Native FLTK still owns clicks, keyboard activation and focus.
+        false
+    });
+    button.draw(move |b| {
+        let active = b.active_r();
+        let pressed = b.value();
+        let (top, bottom) = if !active {
+            (PANEL, PANEL)
+        } else if pressed {
+            (
+                Color::from_rgb(168, 186, 192),
+                Color::from_rgb(206, 219, 223),
+            )
+        } else if hover.get() {
+            (
+                Color::from_rgb(235, 246, 251),
+                Color::from_rgb(185, 209, 219),
+            )
+        } else {
+            (Color::from_rgb(240, 239, 233), PANEL)
+        };
+        let (x, y, w, h) = (b.x(), b.y(), b.w(), b.h());
+        gradient(x, y, w, h, top, bottom);
+        draw::draw_box(
+            if pressed {
+                FrameType::DownFrame
+            } else {
+                FrameType::UpFrame
+            },
+            x,
+            y,
+            w,
+            h,
+            PANEL,
+        );
+        draw::draw_rect_with_color(
+            x,
+            y,
+            w,
+            h,
+            if b.has_focus() && active {
+                Color::from_rgb(100, 131, 141)
+            } else if primary && active {
+                GREEN
+            } else {
+                Color::from_rgb(105, 108, 105)
+            },
+        );
+        let offset = i32::from(pressed);
+        draw::push_clip(x + 4, y + 3, w - 8, h - 6);
+        draw::set_font(b.label_font(), b.label_size());
+        draw::set_draw_color(if active {
+            Color::Black
+        } else {
+            Color::from_rgb(125, 125, 121)
+        });
+        draw::draw_text2(&b.label(), x + offset, y + offset, w, h, Align::Center);
+        draw::pop_clip();
+    });
+}
+
+fn gradient(x: i32, y: i32, w: i32, h: i32, top: Color, bottom: Color) {
+    let (r1, g1, b1) = top.to_rgb();
+    let (r2, g2, b2) = bottom.to_rgb();
+    for row in 0..h {
+        let mix = |a: u8, b: u8| {
+            (i32::from(a) + (i32::from(b) - i32::from(a)) * row / (h - 1).max(1)) as u8
+        };
+        draw::set_draw_color(Color::from_rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2)));
+        draw::draw_line(x, y + row, x + w - 1, y + row);
+    }
 }
 fn field_style<W: WidgetExt>(widget: &mut W) {
     widget.set_frame(FrameType::DownBox);
@@ -150,32 +240,183 @@ fn recessed(mut frame: Frame) -> Frame {
     frame
 }
 fn panel(mut group: Group) -> Group {
+    group.super_draw(false);
     group.set_frame(FrameType::EngravedBox);
     group.set_color(PANEL);
+    group.draw(|g| {
+        // Child-only damage must not erase the unchanged siblings.
+        if g.damage_type() == Damage::Child {
+            g.draw_children();
+            return;
+        }
+        let (x, y, w, h) = (g.x(), g.y(), g.w(), g.h());
+        draw::draw_rbox(x, y, w, h, 6, true, Color::from_rgb(128, 131, 127));
+        draw::draw_rbox(x + 1, y + 1, w - 2, h - 2, 5, true, Color::White);
+        draw::draw_rbox(x + 2, y + 2, w - 4, h - 4, 4, true, PANEL);
+        gradient(
+            x + 6,
+            y + 2,
+            w - 12,
+            h - 4,
+            Color::from_rgb(237, 237, 232),
+            PANEL,
+        );
+        g.draw_children();
+    });
     group
 }
 fn heading(mut frame: Frame, text: &str, size: i32) {
     frame.set_label(text);
     frame.set_label_size(size);
-    frame.set_align(Align::Center | Align::Inside);
+    frame.set_align(Align::Center | Align::Inside | Align::Clip);
 }
 fn icon(mut frame: Frame, host: bool) {
+    frame.super_draw(false);
+    let pixels: &[u8] = if host {
+        include_bytes!("../assets/host-icon.rgba")
+    } else {
+        include_bytes!("../assets/connect-icon.rgba")
+    };
+    let mut image = RgbImage::new(pixels, 96, 96, ColorDepth::Rgba8)
+        .expect("embedded role icon must contain 96x96 RGBA pixels");
     frame.draw(move |f| {
-        draw::set_draw_color(Color::from_rgb(45, 45, 42));
-        let (x, y, w) = (f.x(), f.y(), f.w());
-        if host {
-            draw::draw_pie(x + w / 2 - 11, y + 10, 22, 22, 0., 360.);
-            draw::draw_arc(x + w / 2 - 31, y + 29, 62, 48, 180., 360.);
-            draw::draw_line(x + w / 2 - 31, y + 53, x + w / 2 + 31, y + 53);
-        } else {
-            let sw = 58;
-            draw::draw_rect(x + (w - sw) / 2, y + 11, sw, 39);
-            draw::draw_rectf(x + (w - 22) / 2, y + 21, 22, 15);
-            draw::draw_line(x + w / 2, y + 50, x + w / 2, y + 59);
-            draw::draw_line(x + w / 2 - 18, y + 59, x + w / 2 + 18, y + 59);
-        }
+        draw::push_clip(f.x(), f.y(), f.w(), f.h());
+        image.draw(f.x() + (f.w() - 96) / 2, f.y() + (f.h() - 96) / 2, 96, 96);
+        draw::pop_clip();
     });
 }
+
+fn ellipsis(text: &str, width: i32) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if draw::width(&clean) <= f64::from(width) {
+        return clean;
+    }
+    let mut short = clean;
+    while !short.is_empty() && draw::width(&format!("{short}…")) > f64::from(width) {
+        short.pop();
+    }
+    format!("{short}…")
+}
+
+fn computer_list(browser: &mut HoldBrowser, host: bool) {
+    browser.set_color(BG);
+    browser.set_selection_color(SELECTED);
+    browser.set_has_scrollbar(BrowserScrollbar::VerticalAlways);
+    browser.set_scrollbar_size(16);
+    let hovered_y = Rc::new(Cell::new(None));
+    let events = hovered_y.clone();
+    browser.handle(move |b, event| {
+        match event {
+            Event::Move | Event::Enter => events.set(Some(app::event_y())),
+            Event::Leave => events.set(None),
+            _ => return false,
+        }
+        b.redraw();
+        false
+    });
+    // Native browser retains selection, scrolling and keyboard interaction.
+    // Only the interior is overpainted; the scrollbar and recessed frame stay native.
+    browser.draw(move |b| {
+        let (x, y, w, h) = (b.x() + 2, b.y() + 2, b.w() - 20, b.h() - 4);
+        draw::push_clip(x, y, w, h);
+        draw::set_draw_color(BG);
+        draw::draw_rectf(x, y, w, h);
+        draw::set_font(Font::Helvetica, 13);
+        let row_h = draw::height().max(24);
+        if b.size() == 0 {
+            draw::set_draw_color(Color::Black);
+            let empty_y = y + (h - 64).max(0) / 2;
+            draw::draw_text2("Looking for computers", x, empty_y, w, 24, Align::Center);
+            draw::set_font(Font::Helvetica, 12);
+            draw::set_draw_color(Color::from_rgb(85, 85, 80));
+            draw::draw_text2(
+                if host {
+                    "Open Pair on another computer and choose Connect."
+                } else {
+                    "Open Pair on another computer and choose Host."
+                },
+                x + 8,
+                empty_y + 28,
+                w - 16,
+                32,
+                Align::Center | Align::Wrap,
+            );
+        } else {
+            for line in 1..=b.size() {
+                let row_y = y + (line - 1) * row_h - b.position();
+                if row_y + row_h <= y || row_y >= y + h {
+                    continue;
+                }
+                let selected = b.value() == line;
+                let hovered = hovered_y
+                    .get()
+                    .is_some_and(|my| my >= row_y && my < row_y + row_h);
+                draw::set_draw_color(if selected {
+                    SELECTED
+                } else if hovered {
+                    Color::from_rgb(225, 234, 237)
+                } else {
+                    BG
+                });
+                draw::draw_rectf(x, row_y, w, row_h);
+                if selected {
+                    draw::draw_rect_with_color(x, row_y, w, row_h, GREEN);
+                }
+                let text = b.text(line).unwrap_or_default();
+                let (name, state) = text.rsplit_once('\t').unwrap_or((&text, "Offline"));
+                let online = matches!(state, "Available" | "Connected");
+                draw::set_draw_color(if online {
+                    GREEN
+                } else {
+                    Color::from_rgb(151, 153, 148)
+                });
+                draw::draw_pie(x + 8, row_y + (row_h - 6) / 2, 6, 6, 0., 360.);
+                draw::set_draw_color(Color::Black);
+                draw::draw_text2(
+                    &ellipsis(name, w - 144),
+                    x + 24,
+                    row_y,
+                    w - 144,
+                    row_h,
+                    Align::Left,
+                );
+                draw::set_draw_color(if online {
+                    GREEN
+                } else {
+                    Color::from_rgb(85, 85, 80)
+                });
+                draw::draw_text2(state, x + w - 112, row_y, 104, row_h, Align::Left);
+            }
+        }
+        draw::pop_clip();
+    });
+}
+
+fn row_icons(browser: &mut HoldBrowser) {
+    for line in 1..=browser.size() {
+        if browser.icon(line).is_none() {
+            browser.set_icon(
+                line,
+                Some(
+                    RgbImage::new(&[0; 88], 1, 22, ColorDepth::Rgba8)
+                        .expect("fixed transparent row spacer"),
+                ),
+            );
+        }
+    }
+}
+
+fn computer_row(name: &str, state: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("{name}\t{state}")
+}
+
 fn choose_font() {
     let fonts = app::fonts();
     let choices: &[&str] = if cfg!(target_os = "windows") {
@@ -193,39 +434,214 @@ fn choose_font() {
     }
 }
 
+// Keep labels inside their allocated rectangles, including remote device names.
+fn bound_labels(group: &mut Group) {
+    for i in 0..group.children() {
+        if let Some(mut child) = group.child(i) {
+            if child.align().contains(Align::Inside) {
+                child.set_align(child.align() | Align::Clip);
+            }
+            if let Some(mut nested) = child.as_group() {
+                bound_labels(&mut nested);
+            }
+        }
+    }
+}
+
+fn place(group: &Group, index: i32, x: i32, y: i32, w: i32, h: i32) {
+    if let Some(mut child) = group.child(index) {
+        child.resize(x, y, w, h);
+    }
+}
+
+fn footer(mut frame: Frame) {
+    frame.super_draw(false);
+    let mut pixels = include_bytes!("../assets/pear-icon.rgba").to_vec();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = (u16::from(pixel[3]) * 55 / 100) as u8;
+    }
+    let mut pear = RgbImage::new(&pixels, 24, 24, ColorDepth::Rgba8)
+        .expect("embedded Pair logo must contain 24x24 RGBA pixels");
+    pear.scale(20, 20, true, true);
+    frame.draw(move |f| {
+        draw::set_draw_color(BG);
+        draw::draw_rectf(f.x(), f.y(), f.w(), f.h());
+        pear.draw(f.x() + MARGIN + 30, f.y() + 1, 20, 20);
+        draw::set_draw_color(Color::from_rgb(130, 130, 124));
+        draw::set_font(Font::HelveticaBold, 13);
+        draw::draw_text2("pair", f.x() + MARGIN, f.y() - 2, 32, f.h(), Align::Left);
+        draw::set_draw_color(Color::from_rgb(130, 130, 124));
+        draw::draw_text2(
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            f.x() + f.w() - 110,
+            f.y() - 2,
+            94,
+            f.h(),
+            Align::Right,
+        );
+    });
+}
+
+fn layout_screens(screens: &mut [Group; 4], w: i32, h: i32) {
+    for screen in screens.iter_mut() {
+        screen.resize(0, 0, w, h);
+        place(screen, screen.children() - 1, 0, h - STATUS_H, w, STATUS_H);
+    }
+    let landing = &screens[0];
+    let card_w = (CONTENT_W.min(w - 2 * MARGIN) - GAP) / 2;
+    let left = (w - 2 * card_w - GAP) / 2;
+    let top = ((h - STATUS_H - 320) / 2).clamp(24, 72);
+    place(landing, 0, MARGIN, MARGIN, w - 2 * MARGIN, 24);
+    place(landing, 1, left, top, 2 * card_w + GAP, ROW);
+    for (index, x) in [(2, left), (3, left + card_w + GAP)] {
+        place(landing, index, x, top + ROW + GAP, card_w, 248);
+        if let Some(card) = landing.child(index).and_then(|c| c.as_group()) {
+            if let Some(mut title) = card.child(0) {
+                title.show();
+            }
+            place(&card, 0, x + MARGIN, top + 48, card_w - 2 * MARGIN, ROW);
+            place(&card, 1, x + (card_w - 96) / 2, top + 88, 96, 96);
+            place(&card, 2, x + MARGIN, top + 192, card_w - 2 * MARGIN, 24);
+            place(&card, 3, x + MARGIN, top + 232, card_w - 2 * MARGIN, 32);
+        }
+    }
+    if let Some(mut ready) = landing.child(4) {
+        ready.hide();
+    }
+    // Branding lives in the shared bottom bar now.
+    for index in [5, 6] {
+        if let Some(mut child) = landing.child(index) {
+            child.hide();
+        }
+    }
+    let width = CONTENT_W.min(w - 2 * MARGIN);
+    let x = (w - width) / 2;
+    for (screen, is_host) in [(&screens[1], true), (&screens[2], false)] {
+        let (list, status, phrase, confirm, reject) = if is_host {
+            (7, 3, 4, 5, 6)
+        } else {
+            (3, 5, 6, 7, 8)
+        };
+        let help_open = screen.child(10).is_some_and(|c| c.visible());
+        let pairing_open = screen.child(phrase).is_some_and(|c| c.visible());
+        let extra = if help_open {
+            if is_host { 64 } else { 96 }
+        } else {
+            0
+        } + if pairing_open { 104 } else { 0 };
+        let action_y = (112 + LIST_H + GAP + extra).min(h - STATUS_H - GAP - ROW);
+        let status_y = action_y;
+        place(screen, 0, x, 12, width, ROW);
+        place(screen, 1, x + 112, 52, width - 212, ROW);
+        place(screen, 2, x + width - 92, 52, 92, ROW);
+        place(screen, 11, x, action_y, 80, ROW);
+        place(screen, 9, x + 88, action_y, 160, ROW);
+        place(
+            screen,
+            if is_host { 8 } else { 4 },
+            x + width - 120,
+            action_y,
+            120,
+            ROW,
+        );
+        if let Some(mut status) = screen.child(status) {
+            status.hide();
+        }
+        let mut list_bottom = status_y - GAP;
+        if let Some(mut help) = screen.child(10).and_then(|c| c.as_group()) {
+            let help_h = if is_host { 56 } else { 88 };
+            let help_y = list_bottom - help_h;
+            help.resize(x, help_y, width, help_h);
+            help.set_frame(FrameType::EngravedBox);
+            if is_host {
+                place(&help, 0, x + 60, help_y + 12, 100, ROW);
+                place(&help, 1, x + 180, help_y + 12, 145, ROW);
+            } else {
+                place(&help, 0, x + 34, help_y + 6, width - 380, ROW);
+                place(&help, 1, x + width - 296, help_y + 6, 100, ROW);
+                place(&help, 2, x + width - 186, help_y + 6, 170, ROW);
+                place(&help, 3, x + 16, help_y + 46, 100, ROW);
+                place(&help, 4, x + 124, help_y + 46, 120, ROW);
+                place(&help, 5, x + 258, help_y + 40, width - 274, 40);
+            }
+            if help_open {
+                list_bottom = help_y - GAP;
+            }
+        }
+        if pairing_open {
+            let phrase_y = list_bottom - 96;
+            place(screen, phrase, x, phrase_y, width, 52);
+            place(screen, confirm, x + width - 338, phrase_y + 60, 240, ROW);
+            place(screen, reject, x + width - 90, phrase_y + 60, 90, ROW);
+            list_bottom = phrase_y - GAP;
+        }
+        let list_h = (list_bottom - 112).min(LIST_H);
+        place(screen, list, x, 112, width, list_h);
+        let empty = screen
+            .child(list)
+            .and_then(|c| HoldBrowser::from_dyn_widget(&c))
+            .is_some_and(|b| b.size() == 0);
+        let centered_search = empty;
+        place(
+            screen,
+            12,
+            if centered_search {
+                x + (width - 120) / 2
+            } else {
+                x + width - 256
+            },
+            action_y,
+            120,
+            ROW,
+        );
+        if let Some(mut list_widget) = screen.child(list) {
+            list_widget.set_align(Align::TopLeft);
+        }
+    }
+    let workspace = &screens[3];
+    place(workspace, 0, MARGIN, GAP, w - 464, ROW);
+    for (i, offset, width) in [(2, 438, 120), (3, 308, 84), (4, 214, 94), (5, 110, 94)] {
+        place(workspace, i, w - offset, GAP, width, ROW);
+    }
+    place(workspace, 7, MARGIN, 48, w - 2 * MARGIN, 24);
+    let editor_h = h - STATUS_H - 90;
+    place(workspace, 6, MARGIN, 82, w - 2 * MARGIN, editor_h);
+    if let Some(area) = workspace.child(6).and_then(|c| c.as_group()) {
+        for i in 0..2 {
+            place(&area, i, MARGIN, 82, w - 2 * MARGIN, editor_h);
+        }
+    }
+    if let Some(mut status) = workspace.child(1) {
+        status.hide();
+    }
+    for screen in screens {
+        screen.redraw();
+    }
+}
+
 impl Ui {
     fn new(tx: mpsc::Sender<Action>, store: Store) -> Self {
         let device = store.device();
-        let mut window = Window::new(100, 100, 900, 650, "pair").center_screen();
+        let mut window = Window::new(100, 100, 760, 500, "pair").center_screen();
         window.set_color(BG);
-        window.size_range(800, 600, 0, 0);
+        window.size_range(760, 500, 0, 0);
         let card_w = (window.w() - 2 * LANDING_INSET - CARD_GAP) / 2;
         let connect_x = (window.w() - (2 * card_w + CARD_GAP)) / 2;
         let host_x = connect_x + card_w + CARD_GAP;
 
         let landing = Group::new(0, 0, 900, 650, None);
-        let mut menu = MenuBar::new(0, 0, 900, MENU_H, None);
-        menu.add("File", Shortcut::None, fltk::menu::MenuFlag::Normal, |_| {});
-        menu.add(
-            "Connection",
-            Shortcut::None,
-            fltk::menu::MenuFlag::Normal,
-            |_| {},
-        );
-        menu.add("Help", Shortcut::None, fltk::menu::MenuFlag::Normal, |_| {});
-        menu.set_frame(FrameType::UpBox);
-        menu.set_color(PANEL);
+        heading(Frame::new(0, 0, 900, 24, None), "", 14);
         heading(
             Frame::new(0, 72, 900, 38, None),
             "How do you want to pair?",
-            22,
+            18,
         );
         // These cards use the same width and a single centered gutter at the default size.
         let connect_card = panel(Group::new(connect_x, 135, card_w, 330, None));
         heading(
             Frame::new(connect_x + MARGIN, 150, card_w - 2 * MARGIN, 30, None),
             "Connect",
-            19,
+            16,
         );
         icon(
             Frame::new(connect_x + 60, 191, card_w - 120, 72, None),
@@ -240,6 +656,7 @@ impl Ui {
         );
         connect_description.set_align(Align::Center | Align::Inside);
         connect_description.set_label_color(Color::from_rgb(72, 72, 68));
+        connect_description.set_label_size(12);
         let mut open_connect = Button::new(connect_x + 52, 340, card_w - 104, 38, "Connect");
         button_style(&mut open_connect, true);
         connect_card.end();
@@ -247,7 +664,7 @@ impl Ui {
         heading(
             Frame::new(host_x + MARGIN, 150, card_w - 2 * MARGIN, 30, None),
             "Host",
-            19,
+            16,
         );
         icon(Frame::new(host_x + 60, 191, card_w - 120, 72, None), true);
         let mut host_description = Frame::new(
@@ -255,15 +672,16 @@ impl Ui {
             280,
             card_w - 2 * MARGIN,
             24,
-            "Share from this computer",
+            "Share this note",
         );
         host_description.set_align(Align::Center | Align::Inside);
         host_description.set_label_color(Color::from_rgb(72, 72, 68));
+        host_description.set_label_size(12);
         let mut open_host = Button::new(host_x + 52, 340, card_w - 104, 38, "Host");
         button_style(&mut open_host, true);
         host_card.end();
-        let mut landing_status = recessed(Frame::new(0, 622, 900, STATUS_H, "●  Ready"));
-        landing_status.set_label_color(GREEN);
+        let mut landing_status = recessed(Frame::new(0, 622, 900, STATUS_H, "Ready"));
+        landing_status.set_label_color(Color::from_rgb(65, 65, 62));
         landing_status.set_align(Align::Left | Align::Inside);
         let mut wordmark = Frame::new(MARGIN, 586, 180, 24, "pair");
         wordmark.set_label_size(24);
@@ -274,7 +692,9 @@ impl Ui {
         landing.end();
 
         let mut host = Group::new(0, 0, 900, 650, None);
-        heading(Frame::new(0, 35, 900, 45, None), "Host a note", 30);
+        host.set_frame(FrameType::ThinUpBox);
+        host.set_color(BG);
+        heading(Frame::new(0, 35, 900, 45, None), "Host a note", 18);
         let mut host_name = Input::new(285, 105, 330, 36, "This computer  ");
         host_name.set_value(&device.name);
         field_style(&mut host_name);
@@ -284,13 +704,18 @@ impl Ui {
         host_status.set_align(Align::Center | Align::Inside | Align::Wrap);
         let mut host_phrase = recessed(Frame::new(120, 225, 660, 82, "Waiting for a computer..."));
         host_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
-        host_phrase.set_label_size(15);
+        host_phrase.set_label_size(12);
+        host_status.set_label_size(12);
+        host_status.set_align(Align::Left | Align::Inside | Align::Clip);
         let mut host_confirm = Button::new(265, 318, 240, 38, "Phrase Matches — Pair");
         button_style(&mut host_confirm, true);
         let mut host_reject = Button::new(515, 318, 105, 38, "Reject");
         button_style(&mut host_reject, false);
-        let mut peers = Choice::new(285, 390, 300, 34, "Paired devices  ");
+        let mut peers = HoldBrowser::new(285, 390, 300, 34, "Computers");
+        peers.set_text_size(13);
+        peers.set_format_char('\x01');
         field_style(&mut peers);
+        computer_list(&mut peers, true);
         let mut remove_peer = Button::new(595, 390, 125, 34, "Remove");
         button_style(&mut remove_peer, false);
         let mut toggle_host_advanced = Button::new(350, 440, 200, 32, "Connection help...");
@@ -305,17 +730,26 @@ impl Ui {
         host_advanced.hide();
         let mut host_back = Button::new(25, 585, 90, 38, "Stop");
         button_style(&mut host_back, false);
+        let mut host_search = Button::new(0, 0, 120, ROW, "Search again");
+        button_style(&mut host_search, false);
+        callback(&mut host_search, &tx, || Action::RefreshHost);
         host.end();
         host.hide();
 
         let mut connect = Group::new(0, 0, 900, 650, None);
-        heading(Frame::new(0, 35, 900, 45, None), "Connect to a note", 30);
+        connect.set_frame(FrameType::ThinUpBox);
+        connect.set_color(BG);
+        heading(Frame::new(0, 35, 900, 45, None), "Connect to a note", 18);
         let mut connect_name = Input::new(285, 82, 300, 30, "This computer  ");
         connect_name.set_value(&device.name);
         field_style(&mut connect_name);
         let mut save_connect_name = Button::new(595, 82, 95, 30, "Save name");
         button_style(&mut save_connect_name, false);
-        let mut nearby = Choice::new(245, 125, 410, 38, "Nearby  ");
+        let mut nearby = HoldBrowser::new(245, 125, 410, 38, "Computers");
+        nearby.set_text_size(13);
+        nearby.set_tooltip("Select a computer, then choose Connect.");
+        computer_list(&mut nearby, false);
+        nearby.set_format_char('\x01');
         field_style(&mut nearby);
         let mut connect_button = Button::new(380, 177, 180, 40, "Connect");
         button_style(&mut connect_button, true);
@@ -335,7 +769,9 @@ impl Ui {
             "Select a computer to connect.",
         ));
         connect_phrase.set_align(Align::Center | Align::Inside | Align::Wrap);
-        connect_phrase.set_label_size(15);
+        connect_phrase.set_label_size(12);
+        connect_status.set_label_size(12);
+        connect_status.set_align(Align::Left | Align::Inside | Align::Clip);
         let mut connect_confirm = Button::new(265, 372, 240, 38, "Phrase Matches — Pair");
         button_style(&mut connect_confirm, true);
         let mut connect_reject = Button::new(515, 372, 105, 38, "Reject");
@@ -368,16 +804,19 @@ impl Ui {
         help_group.hide();
         let mut connect_back = Button::new(25, 585, 90, 38, "Back");
         button_style(&mut connect_back, false);
+        let mut connect_search = Button::new(0, 0, 120, ROW, "Search again");
+        button_style(&mut connect_search, false);
+        callback(&mut connect_search, &tx, || Action::Refresh);
         connect.end();
         connect.hide();
 
         let mut workspace = Group::new(0, 0, 900, 650, None);
         let mut workspace_title = Frame::new(16, 12, 220, 34, "Shared note");
         workspace_title.set_align(Align::Left | Align::Inside);
-        workspace_title.set_label_size(20);
+        workspace_title.set_label_size(13);
         let mut workspace_status = recessed(Frame::new(235, 12, 235, 34, "Connecting..."));
         workspace_status.set_align(Align::Left | Align::Inside | Align::Wrap);
-        workspace_status.set_label_size(11);
+        workspace_status.set_label_size(12);
         let mut take = Button::new(480, 12, 115, 34, "Take Control");
         button_style(&mut take, true);
         let mut copy = Button::new(603, 12, 82, 34, "Copy All");
@@ -406,10 +845,28 @@ impl Ui {
         area.end();
         let mut owner = recessed(Frame::new(16, 598, 868, 34, "●  Connecting..."));
         owner.set_align(Align::Left | Align::Inside);
+        owner.set_label_size(12);
         workspace.end();
         workspace.hide();
         window.end();
+        // Own the geometry: only the editor grows vertically, never toolbar rows.
         window.resizable(&workspace);
+        let mut screens = [
+            landing.clone(),
+            host.clone(),
+            connect.clone(),
+            workspace.clone(),
+        ];
+        for (index, screen) in screens.iter_mut().enumerate() {
+            screen.begin();
+            footer(Frame::new(0, 622, 900, STATUS_H, None));
+            screen.end();
+            bound_labels(screen);
+        }
+        layout_screens(&mut screens, window.w(), window.h());
+        window.resize_callback(move |_, _, _, w, h| {
+            layout_screens(&mut screens, w, h);
+        });
 
         let suppress = Rc::new(Cell::new(false));
         buffer.add_modify_callback({
@@ -500,7 +957,34 @@ impl Ui {
             network_status: "Not connected.".into(),
         };
         ui.refresh_peers();
+        ui.update_dialog_layout();
         ui
+    }
+
+    fn update_dialog_layout(&mut self) {
+        let show_pairing = self.pairing.is_some();
+        for mut widget in [
+            self.host_phrase.as_base_widget(),
+            self.host_confirm.as_base_widget(),
+            self.host_reject.as_base_widget(),
+            self.connect_phrase.as_base_widget(),
+            self.connect_confirm.as_base_widget(),
+            self.connect_reject.as_base_widget(),
+        ] {
+            if show_pairing {
+                widget.show();
+            } else {
+                widget.hide();
+            }
+        }
+        let mut screens = [
+            self.landing.clone(),
+            self.host.clone(),
+            self.connect.clone(),
+            self.workspace.clone(),
+        ];
+        layout_screens(&mut screens, self.window.w(), self.window.h());
+        self.window.redraw();
     }
 
     fn show(&mut self, screen: Screen) {
@@ -520,15 +1004,15 @@ impl Ui {
     fn refresh_peers(&mut self) {
         self.peers.clear();
         for peer in self.store.trusted_peers() {
-            self.peers.add_choice(&peer.name);
+            self.peers.add(&format!("{}\tOffline", peer.name));
         }
         if self.peers.size() > 0 {
-            self.peers.set_value(0);
+            self.peers.select(1);
             self.remove_peer.activate();
+            self.remove_peer.show();
         } else {
-            self.peers.add_choice("No paired devices");
-            self.peers.set_value(0);
             self.remove_peer.deactivate();
+            self.remove_peer.hide();
         }
     }
     fn parse_port(text: &str) -> Result<u16, String> {
@@ -610,7 +1094,7 @@ impl Ui {
                 name: Some(device.name.clone()),
                 pairing: saved.map(|host| host.pairing.clone()),
             });
-            self.nearby.add_choice(&format!(
+            self.nearby.add(&format!(
                 "{}{}",
                 device.name,
                 if saved.is_some() { "  —  Paired" } else { "" }
@@ -627,7 +1111,7 @@ impl Ui {
             && !self.discovered.iter().any(|device| device.id == host.id)
         {
             self.nearby
-                .add_choice(&format!("{}  —  Paired (last address)", host.name));
+                .add(&format!("{}  —  Paired (last address)", host.name));
             self.targets.push(ConnectTarget {
                 addresses: vec![host.address],
                 id: Some(host.id),
@@ -636,11 +1120,10 @@ impl Ui {
             });
         }
         if self.targets.is_empty() {
-            self.nearby.add_choice("Searching...");
             self.nearby.deactivate();
         } else {
             self.nearby.activate();
-            self.nearby.set_value(0);
+            self.nearby.select(1);
             if self.network.is_none() {
                 self.network_status = format!(
                     "Found {}",
@@ -692,7 +1175,7 @@ impl Ui {
             Action::ConnectNearby => {
                 let target = self
                     .targets
-                    .get(self.nearby.value().max(0) as usize)
+                    .get((self.nearby.value() - 1).max(0) as usize)
                     .cloned()
                     .ok_or("No nearby computer is selected.")?;
                 self.connect_target(target)?;
@@ -718,12 +1201,17 @@ impl Ui {
                 })?;
             }
             Action::Refresh => self.refresh_discovery(),
+            Action::RefreshHost => {
+                self.refresh_peers();
+                self.notice = "Listening for connections".into();
+            }
             Action::ToggleHelp => {
                 if self.help_group.visible() {
                     self.help_group.hide()
                 } else {
                     self.help_group.show()
                 }
+                self.update_dialog_layout();
             }
             Action::ToggleHostAdvanced => {
                 if self.host_advanced.visible() {
@@ -731,6 +1219,7 @@ impl Ui {
                 } else {
                     self.host_advanced.show()
                 }
+                self.update_dialog_layout();
             }
             Action::SaveName => {
                 self.store.set_name(&self.host_name.value())?;
@@ -742,7 +1231,7 @@ impl Ui {
             }
             Action::RemovePeer => {
                 let peers = self.store.trusted_peers();
-                if let Some(peer) = peers.get(self.peers.value().max(0) as usize) {
+                if let Some(peer) = peers.get((self.peers.value() - 1).max(0) as usize) {
                     self.store.forget_peer(&peer.id)?;
                     self.notice = format!("Removed {}.", peer.name);
                     self.refresh_peers();
@@ -866,7 +1355,55 @@ impl Ui {
         true
     }
 
+    fn present_computers(&mut self) {
+        for (index, target) in self.targets.iter().enumerate() {
+            let active = target
+                .id
+                .as_ref()
+                .is_some_and(|id| Some(id) == self.active_target_id.as_ref());
+            let available = target
+                .id
+                .as_ref()
+                .is_some_and(|id| self.discovered.iter().any(|device| &device.id == id));
+            let state = if active && self.pairing.as_ref().is_some_and(|p| p.repairing) {
+                "Needs repair"
+            } else if active && self.model.connected {
+                "Connected"
+            } else if available {
+                "Available"
+            } else {
+                "Offline"
+            };
+            let line = index as i32 + 1;
+            let text = computer_row(target.name.as_deref().unwrap_or("Computer"), state);
+            if self.nearby.text(line).as_deref() != Some(&text) {
+                self.nearby.set_text(line, &text);
+            }
+        }
+        for (index, peer) in self.store.trusted_peers().iter().enumerate() {
+            let prompt = self.pairing.as_ref().filter(|p| p.other_name == peer.name);
+            let state = if prompt.is_some_and(|p| p.repairing) {
+                "Needs repair"
+            } else if prompt.is_some() && self.model.connected {
+                "Connected"
+            } else {
+                "Offline"
+            };
+            let line = index as i32 + 1;
+            let text = computer_row(&peer.name, state);
+            if self.peers.text(line).as_deref() != Some(&text) {
+                self.peers.set_text(line, &text);
+            }
+        }
+        row_icons(&mut self.peers);
+        row_icons(&mut self.nearby);
+        if self.screen != Screen::Workspace {
+            self.update_dialog_layout();
+        }
+    }
+
     fn render(&mut self) {
+        self.present_computers();
         if self.buffer.text() != self.model.text {
             self.suppress.set(true);
             let cursor = self
@@ -889,6 +1426,9 @@ impl Ui {
             || "No phrase confirmation needed.".into(),
             |prompt| format!("UNVERIFIED — compare exactly:\n{}", prompt.phrase),
         );
+        if self.host_phrase.visible() != self.pairing.is_some() {
+            self.update_dialog_layout();
+        }
         self.host_phrase.set_label(&phrase);
         self.connect_phrase.set_label(&phrase);
         let confirm = self
@@ -925,7 +1465,10 @@ impl Ui {
         };
         self.host_status.set_label(&status);
         self.connect_status.set_label(&status);
+        self.host_status.set_tooltip(&status);
+        self.connect_status.set_tooltip(&status);
         self.workspace_status.set_label(&status);
+        self.workspace_status.set_tooltip(&status);
         let name = self
             .store
             .trusted_host()
@@ -933,6 +1476,8 @@ impl Ui {
             .unwrap_or_else(|| self.store.device().name);
         self.workspace_title
             .set_label(&format!("Shared with {name}"));
+        self.workspace_title
+            .set_tooltip(&format!("Shared with {name}"));
         let other = self
             .model
             .snapshot
