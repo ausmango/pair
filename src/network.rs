@@ -835,16 +835,16 @@ async fn run_host(
     publisher.view.bound_address = Some(bound);
     publisher.view.sync_serial = 1;
     publisher.state(&authority);
+    let advertiser = Advertiser::start(&store.device(), bound.port());
+    publisher.view.status = match &advertiser {
+        Ok(_) => format!(
+            "Hosting as {}. Waiting for a nearby computer.",
+            store.device().name
+        ),
+        Err(error) => format!("Hosting on {bound}; discovery unavailable: {error}"),
+    };
+    publisher.publish();
     loop {
-        let advertiser = Advertiser::start(&store.device(), bound.port());
-        publisher.view.status = match &advertiser {
-            Ok(_) => format!(
-                "Hosting as {}. Waiting for a nearby computer.",
-                store.device().name
-            ),
-            Err(error) => format!("Hosting on {bound}; discovery unavailable: {error}"),
-        };
-        publisher.publish();
         let accepted = loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -854,7 +854,6 @@ async fn run_host(
                 accepted = listener.accept() => break accepted.map_err(io_message)?,
             }
         };
-        drop(advertiser);
         match accept_incoming(accepted.0, &identity, &store).await {
             Ok(Incoming::Authenticated(stream)) => {
                 authority.connection_changed();

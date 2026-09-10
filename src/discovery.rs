@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr, TcpStream},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -18,12 +18,270 @@ pub const SERVICE_TYPE: &str = "_pair._tcp.local.";
 pub const MAX_DISCOVERED: usize = 32;
 pub const MAX_ADDRESSES_PER_DEVICE: usize = 8;
 const STALE_AFTER: Duration = Duration::from_secs(120);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_PROBE_ADDRESSES: usize = 4;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DiscoveredDevice {
     pub id: String,
     pub name: String,
     pub addresses: Vec<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceConnectionState {
+    FoundJustNow,
+    CheckingReachability,
+    ReadyToPair,
+    ReadyToConnect,
+    Connecting,
+    Connected,
+    Retrying,
+    FoundButUnreachable,
+    Offline,
+}
+
+impl DeviceConnectionState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FoundJustNow => "Found just now",
+            Self::CheckingReachability => "Checking connection…",
+            Self::ReadyToPair => "Ready to pair",
+            Self::ReadyToConnect => "Ready to connect",
+            Self::Connecting => "Establishing secure connection…",
+            Self::Connected => "Connected",
+            Self::Retrying => "Retrying…",
+            Self::FoundButUnreachable => "Found but unreachable",
+            Self::Offline => "Offline",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectionDevice {
+    pub device: DiscoveredDevice,
+    pub state: DeviceConnectionState,
+    pub last_seen: Option<Instant>,
+    pub paired: bool,
+    pub last_connected: Option<Instant>,
+    pub last_method: Option<String>,
+    pub failure: Option<String>,
+    generation: u64,
+    prompted: bool,
+    suppressed: bool,
+}
+
+#[derive(Clone)]
+pub struct ProbeRequest {
+    pub id: String,
+    pub generation: u64,
+    pub addresses: Vec<SocketAddr>,
+}
+
+#[derive(Default)]
+pub struct ConnectionFlow {
+    devices: BTreeMap<String, ConnectionDevice>,
+}
+
+impl ConnectionFlow {
+    pub fn observe(
+        &mut self,
+        discovered: &[DiscoveredDevice],
+        paired_id: Option<&str>,
+        now: Instant,
+    ) -> Vec<ProbeRequest> {
+        let visible: BTreeSet<_> = discovered.iter().map(|device| device.id.as_str()).collect();
+        for known in self.devices.values_mut() {
+            if !visible.contains(known.device.id.as_str()) {
+                known.state = DeviceConnectionState::Offline;
+            }
+        }
+        self.devices.retain(|id, known| {
+            paired_id == Some(id.as_str())
+                || known
+                    .last_seen
+                    .is_some_and(|seen| now.saturating_duration_since(seen) < STALE_AFTER)
+        });
+        let mut probes = Vec::new();
+        for device in discovered {
+            let paired = paired_id == Some(device.id.as_str());
+            let known = self
+                .devices
+                .entry(device.id.clone())
+                .or_insert_with(|| ConnectionDevice {
+                    device: device.clone(),
+                    state: DeviceConnectionState::Offline,
+                    last_seen: Some(now),
+                    paired,
+                    last_connected: None,
+                    last_method: None,
+                    failure: None,
+                    generation: 0,
+                    prompted: false,
+                    suppressed: false,
+                });
+            let reappeared = known.state == DeviceConnectionState::Offline;
+            let addresses_changed = known.device.addresses != device.addresses;
+            known.device = device.clone();
+            known.last_seen = Some(now);
+            known.paired = paired;
+            if reappeared {
+                known.prompted = false;
+                known.suppressed = false;
+            }
+            if reappeared || addresses_changed {
+                known.generation = known.generation.wrapping_add(1);
+                known.state = DeviceConnectionState::FoundJustNow;
+                known.failure = None;
+                probes.push(ProbeRequest {
+                    id: device.id.clone(),
+                    generation: known.generation,
+                    addresses: device
+                        .addresses
+                        .iter()
+                        .copied()
+                        .take(MAX_PROBE_ADDRESSES)
+                        .collect(),
+                });
+            }
+        }
+        probes
+    }
+
+    pub fn devices(&self) -> impl Iterator<Item = &ConnectionDevice> {
+        self.devices.values()
+    }
+
+    pub fn remember_offline(&mut self, device: DiscoveredDevice) {
+        self.devices
+            .entry(device.id.clone())
+            .or_insert(ConnectionDevice {
+                device,
+                state: DeviceConnectionState::Offline,
+                last_seen: None,
+                paired: true,
+                last_connected: None,
+                last_method: None,
+                failure: None,
+                generation: 0,
+                prompted: false,
+                suppressed: false,
+            });
+    }
+
+    pub fn device(&self, id: &str) -> Option<&ConnectionDevice> {
+        self.devices.get(id)
+    }
+
+    pub fn begin_probe(&mut self, request: &ProbeRequest) -> bool {
+        let Some(device) = self.devices.get_mut(&request.id) else {
+            return false;
+        };
+        if device.generation != request.generation {
+            return false;
+        }
+        device.state = DeviceConnectionState::CheckingReachability;
+        true
+    }
+
+    pub fn finish_probe(&mut self, id: &str, generation: u64, reachable: bool) -> bool {
+        let Some(device) = self.devices.get_mut(id) else {
+            return false;
+        };
+        if device.generation != generation
+            || device.state != DeviceConnectionState::CheckingReachability
+        {
+            return false;
+        }
+        device.state = if reachable {
+            if device.paired {
+                DeviceConnectionState::ReadyToConnect
+            } else {
+                DeviceConnectionState::ReadyToPair
+            }
+        } else {
+            DeviceConnectionState::FoundButUnreachable
+        };
+        device.failure = (!reachable).then(|| "No discovered address responded.".into());
+        true
+    }
+
+    pub fn should_prompt(&self, id: &str) -> bool {
+        self.devices.get(id).is_some_and(|device| {
+            matches!(
+                device.state,
+                DeviceConnectionState::ReadyToPair | DeviceConnectionState::ReadyToConnect
+            ) && !device.prompted
+                && !device.suppressed
+        })
+    }
+
+    pub fn mark_prompted(&mut self, id: &str) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.prompted = true;
+        }
+    }
+
+    pub fn not_now(&mut self, id: &str) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.suppressed = true;
+            device.prompted = true;
+        }
+    }
+
+    pub fn retry(&mut self, id: &str) -> Option<ProbeRequest> {
+        let device = self.devices.get_mut(id)?;
+        device.prompted = false;
+        device.suppressed = false;
+        device.state = DeviceConnectionState::FoundJustNow;
+        Some(ProbeRequest {
+            id: id.into(),
+            generation: device.generation,
+            addresses: device
+                .device
+                .addresses
+                .iter()
+                .copied()
+                .take(MAX_PROBE_ADDRESSES)
+                .collect(),
+        })
+    }
+
+    pub fn mark_connecting(&mut self, id: &str) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.state = DeviceConnectionState::Connecting;
+        }
+    }
+
+    pub fn mark_connected(&mut self, id: &str, now: Instant, method: &str) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.state = DeviceConnectionState::Connected;
+            device.last_connected = Some(now);
+            device.last_method = Some(method.into());
+            device.failure = None;
+        }
+    }
+
+    pub fn mark_retrying(&mut self, id: &str, failure: Option<String>) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.state = DeviceConnectionState::Retrying;
+            device.failure = failure;
+        }
+    }
+
+    pub fn mark_failure(&mut self, id: &str, failure: String) {
+        if let Some(device) = self.devices.get_mut(id) {
+            device.state = DeviceConnectionState::FoundButUnreachable;
+            device.failure = Some(failure);
+        }
+    }
+}
+
+pub fn probe_addresses(addresses: &[SocketAddr]) -> bool {
+    addresses
+        .iter()
+        .take(MAX_PROBE_ADDRESSES)
+        .any(|address| TcpStream::connect_timeout(address, PROBE_TIMEOUT).is_ok())
 }
 
 struct Entry {

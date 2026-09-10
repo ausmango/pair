@@ -6,7 +6,9 @@ use std::{
 };
 
 use pair::{
-    discovery::{DiscoveryCatalog, MAX_DISCOVERED},
+    discovery::{
+        ConnectionFlow, DeviceConnectionState, DiscoveredDevice, DiscoveryCatalog, MAX_DISCOVERED,
+    },
     network::{DiagnosticOutcome, classify_io_error, ordered_addresses},
     persistence::{DeviceIdentity, Store, valid_name},
     tls::{Identity, hex, safety_phrase},
@@ -266,6 +268,84 @@ fn discovery_merges_routed_and_direct_ethernet_addresses() {
     let devices = catalog.devices();
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].addresses.len(), 2);
+}
+
+fn flow_device(id: &str, name: &str) -> DiscoveredDevice {
+    DiscoveredDevice {
+        id: id.into(),
+        name: name.into(),
+        addresses: vec!["192.168.1.8:47321".parse().unwrap()],
+    }
+}
+
+#[test]
+fn connection_flow_transitions_to_ready_for_new_and_paired_devices() {
+    let now = Instant::now();
+    for (paired, expected) in [
+        (false, DeviceConnectionState::ReadyToPair),
+        (true, DeviceConnectionState::ReadyToConnect),
+    ] {
+        let id = "ab".repeat(16);
+        let device = flow_device(&id, "Jetson");
+        let mut flow = ConnectionFlow::default();
+        let probes = flow.observe(&[device], paired.then_some(id.as_str()), now);
+        assert_eq!(
+            flow.device(&id).unwrap().state,
+            DeviceConnectionState::FoundJustNow
+        );
+        assert!(flow.begin_probe(&probes[0]));
+        assert!(flow.finish_probe(&id, probes[0].generation, true));
+        assert_eq!(flow.device(&id).unwrap().state, expected);
+    }
+}
+
+#[test]
+fn connection_flow_not_now_suppresses_duplicates_until_reappearance() {
+    let now = Instant::now();
+    let id = "cd".repeat(16);
+    let device = flow_device(&id, "Studio Mac");
+    let mut flow = ConnectionFlow::default();
+    let probes = flow.observe(&[device.clone()], None, now);
+    flow.begin_probe(&probes[0]);
+    flow.finish_probe(&id, probes[0].generation, true);
+    assert!(flow.should_prompt(&id));
+    flow.not_now(&id);
+    assert!(!flow.should_prompt(&id));
+    assert_ne!(
+        flow.device(&id).unwrap().state,
+        DeviceConnectionState::Connecting
+    );
+    assert!(
+        flow.observe(&[device.clone()], None, now + Duration::from_secs(1))
+            .is_empty()
+    );
+    assert!(!flow.should_prompt(&id));
+    flow.observe(&[], None, now + Duration::from_secs(2));
+    let probes = flow.observe(&[device], None, now + Duration::from_secs(3));
+    flow.begin_probe(&probes[0]);
+    flow.finish_probe(&id, probes[0].generation, true);
+    assert!(flow.should_prompt(&id));
+}
+
+#[test]
+fn connection_flow_reports_found_but_unreachable() {
+    let now = Instant::now();
+    let id = "ef".repeat(16);
+    let mut flow = ConnectionFlow::default();
+    let probes = flow.observe(&[flow_device(&id, "Jetson")], None, now);
+    flow.begin_probe(&probes[0]);
+    flow.finish_probe(&id, probes[0].generation, false);
+    assert_eq!(
+        flow.device(&id).unwrap().state,
+        DeviceConnectionState::FoundButUnreachable
+    );
+    assert!(!flow.should_prompt(&id));
+    let retry = flow.retry(&id).unwrap();
+    assert!(flow.begin_probe(&retry));
+    assert_eq!(
+        flow.device(&id).unwrap().state,
+        DeviceConnectionState::CheckingReachability
+    );
 }
 
 #[test]
