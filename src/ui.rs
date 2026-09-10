@@ -11,7 +11,7 @@ use fltk::{
     browser::{BrowserScrollbar, HoldBrowser},
     button::Button,
     dialog, draw,
-    enums::{Align, Color, ColorDepth, Damage, Event, Font, FrameType},
+    enums::{Align, Color, ColorDepth, Damage, Event, Font, FrameType, Key, Shortcut},
     frame::Frame,
     group::Group,
     image::RgbImage,
@@ -22,9 +22,14 @@ use fltk::{
     window::Window,
 };
 use pair::{
-    discovery::{DiscoveredDevice, DiscoveryBrowser},
+    discovery::{
+        ConnectionFlow, DeviceConnectionState, DiscoveredDevice, DiscoveryBrowser, ProbeRequest,
+        probe_addresses,
+    },
     editor::{Editor, MAX_DRAFTS},
-    network::{Command, ConnectTarget, Mode, Network, PairingPrompt, ordered_addresses},
+    network::{
+        Command, ConnectTarget, ConnectionProgress, Mode, Network, PairingPrompt, ordered_addresses,
+    },
     persistence::Store,
     state::Side,
 };
@@ -58,6 +63,13 @@ enum Action {
     OpenConnect,
     Back,
     ConnectNearby,
+    BeginProbe(ProbeRequest),
+    ProbeComplete {
+        id: String,
+        generation: u64,
+        reachable: bool,
+    },
+    CancelAttempt,
     ConnectManual,
     Refresh,
     RefreshHost,
@@ -96,6 +108,7 @@ struct Ui {
     peers: HoldBrowser,
     remove_peer: Button,
     nearby: HoldBrowser,
+    connect_button: Button,
     connect_name: Input,
     connect_status: Frame,
     connect_phrase: Frame,
@@ -117,6 +130,7 @@ struct Ui {
     network: Option<Network>,
     discovery: Option<DiscoveryBrowser>,
     discovered: Vec<DiscoveredDevice>,
+    connection_flow: ConnectionFlow,
     targets: Vec<ConnectTarget>,
     active_target_id: Option<String>,
     pairing: Option<PairingPrompt>,
@@ -367,7 +381,7 @@ fn computer_list(browser: &mut HoldBrowser, host: bool) {
                 }
                 let text = b.text(line).unwrap_or_default();
                 let (name, state) = text.rsplit_once('\t').unwrap_or((&text, "Offline"));
-                let online = matches!(state, "Available" | "Connected");
+                let online = matches!(state, "Ready to pair" | "Ready to connect" | "Connected");
                 draw::set_draw_color(if online {
                     GREEN
                 } else {
@@ -753,6 +767,7 @@ impl Ui {
         field_style(&mut nearby);
         let mut connect_button = Button::new(380, 177, 180, 40, "Connect");
         button_style(&mut connect_button, true);
+        connect_button.set_shortcut(Shortcut::from_key(Key::Enter));
         let mut connect_status = recessed(Frame::new(
             120,
             220,
@@ -902,6 +917,15 @@ impl Ui {
         callback(&mut copy, &tx, || Action::CopyAll);
         callback(&mut draft, &tx, || Action::Drafts);
         callback(&mut disconnect, &tx, || Action::Disconnect);
+        let escape = tx.clone();
+        window.handle(move |_, event| {
+            if event == Event::KeyDown && app::event_key() == Key::Escape {
+                let _ = escape.send(Action::CancelAttempt);
+                true
+            } else {
+                false
+            }
+        });
         window.set_callback({
             let tx = tx.clone();
             move |_| {
@@ -925,6 +949,7 @@ impl Ui {
             peers,
             remove_peer,
             nearby,
+            connect_button,
             connect_name,
             connect_status,
             connect_phrase,
@@ -946,6 +971,7 @@ impl Ui {
             network: None,
             discovery: None,
             discovered: Vec::new(),
+            connection_flow: ConnectionFlow::default(),
             targets: Vec::new(),
             active_target_id: None,
             pairing: None,
@@ -1030,7 +1056,11 @@ impl Ui {
             Network::start(mode, app::awake).map_err(|_| "Could not start the network thread.")?,
         );
         self.model.start(side);
-        self.network_status = "Starting...".into();
+        self.network_status = if side == Side::Peer {
+            "Establishing secure connection…".into()
+        } else {
+            "Starting...".into()
+        };
         Ok(())
     }
     fn start_host(&mut self) -> Result<(), String> {
@@ -1057,12 +1087,160 @@ impl Ui {
     }
     fn refresh_discovery(&mut self) {
         self.discovery = None;
-        if self.screen == Screen::Connect && self.network.is_none() {
+        if self.screen == Screen::Connect
+            && self.network.is_none()
+            && self.active_target_id.is_none()
+        {
             self.network_status = "Searching nearby".into();
         }
         match DiscoveryBrowser::start(app::awake) {
             Ok(browser) => self.discovery = Some(browser),
             Err(error) => self.notice = error,
+        }
+    }
+
+    fn elapsed_label(at: Option<Instant>) -> String {
+        let Some(at) = at else {
+            return "unknown".into();
+        };
+        let elapsed = at.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            "just now".into()
+        } else if elapsed < Duration::from_secs(60) {
+            format!("{}s ago", elapsed.as_secs())
+        } else {
+            format!("{}m ago", elapsed.as_secs() / 60)
+        }
+    }
+
+    fn refresh_nearby_list(&mut self) {
+        let trusted = self.store.trusted_host();
+        if let Some(host) = trusted.as_ref()
+            && self.connection_flow.device(&host.id).is_none()
+        {
+            self.connection_flow.remember_offline(DiscoveredDevice {
+                id: host.id.clone(),
+                name: host.name.clone(),
+                addresses: vec![host.address],
+            });
+        }
+        let devices: Vec<_> = self.connection_flow.devices().cloned().collect();
+        self.targets.clear();
+        self.nearby.clear();
+        for known in devices {
+            let saved = trusted.as_ref().filter(|host| host.id == known.device.id);
+            self.targets.push(ConnectTarget {
+                addresses: ordered_addresses(
+                    saved.map(|host| host.address),
+                    known.device.addresses.iter().copied(),
+                ),
+                id: Some(known.device.id.clone()),
+                name: Some(known.device.name.clone()),
+                pairing: saved.map(|host| host.pairing.clone()),
+            });
+            let state = if known.state == DeviceConnectionState::Offline {
+                format!(
+                    "Offline · last seen {}",
+                    Self::elapsed_label(known.last_seen)
+                )
+            } else {
+                known.state.label().into()
+            };
+            self.nearby.add(&computer_row(&known.device.name, &state));
+        }
+        if self.targets.is_empty() {
+            self.nearby.deactivate();
+        } else {
+            self.nearby.activate();
+            if self.nearby.value() <= 0 {
+                self.nearby.select(1);
+            }
+        }
+    }
+
+    fn queue_probe(&self, request: ProbeRequest) {
+        let _ = self.tx.send(Action::BeginProbe(request));
+    }
+
+    fn device_details(&self, id: &str) -> String {
+        let Some(device) = self.connection_flow.device(id) else {
+            return "No safe connection details are available.".into();
+        };
+        let mut details = vec![
+            format!("Device: {}", device.device.name),
+            format!("Discovery: {}", device.state.label()),
+            format!(
+                "Discovered addresses: {}",
+                if device.last_seen.is_some() {
+                    device.device.addresses.len()
+                } else {
+                    0
+                }
+            ),
+            format!("Pairing: {}", if device.paired { "Paired" } else { "New" }),
+            format!("Last seen: {}", Self::elapsed_label(device.last_seen)),
+        ];
+        if let Some(connected) = device.last_connected {
+            details.push(format!(
+                "Last successful connection: {}",
+                Self::elapsed_label(Some(connected))
+            ));
+        }
+        if let Some(method) = &device.last_method {
+            details.push(format!("Last successful method: {method}"));
+        }
+        if let Some(failure) = &device.failure {
+            details.push(format!("Last result: {failure}"));
+        }
+        details.join("\n")
+    }
+
+    fn prompt_for_device(&mut self, id: &str) -> Result<(), String> {
+        let device = self
+            .connection_flow
+            .device(id)
+            .cloned()
+            .ok_or("The selected computer is no longer available.")?;
+        let target = self
+            .targets
+            .iter()
+            .find(|target| target.id.as_deref() == Some(id))
+            .cloned()
+            .ok_or("The selected computer is no longer available.")?;
+        self.connection_flow.mark_prompted(id);
+        let (message, primary) = if device.paired {
+            (
+                format!(
+                    "Reconnect to {}?\n\nLast verified device found nearby.",
+                    device.device.name
+                ),
+                "Reconnect",
+            )
+        } else {
+            (
+                format!(
+                    "{} found\n\n{} is visible nearby.\nConnect from {}?",
+                    device.device.name,
+                    device.device.name,
+                    self.store.device().name
+                ),
+                "Connect",
+            )
+        };
+        loop {
+            match dialog::choice2_default(&message, primary, "Not now", "Details") {
+                Some(0) => {
+                    self.connection_flow.mark_connecting(id);
+                    self.network_status = "Establishing secure connection…".into();
+                    self.connect_target(target)?;
+                    return Ok(());
+                }
+                Some(2) => dialog::message_default(&self.device_details(id)),
+                _ => {
+                    self.connection_flow.not_now(id);
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -1078,58 +1256,33 @@ impl Ui {
         if devices == self.discovered {
             return false;
         }
-        self.discovered = devices;
-        self.targets.clear();
-        self.nearby.clear();
         let trusted = self.store.trusted_host();
+        let probes = self.connection_flow.observe(
+            &devices,
+            trusted.as_ref().map(|host| host.id.as_str()),
+            Instant::now(),
+        );
+        self.discovered = devices;
         for device in &self.discovered {
-            let saved = trusted.as_ref().filter(|host| host.id == device.id);
-            let addresses = ordered_addresses(
-                saved.map(|host| host.address),
-                device.addresses.iter().copied(),
-            );
-            self.targets.push(ConnectTarget {
-                addresses: addresses.clone(),
-                id: Some(device.id.clone()),
-                name: Some(device.name.clone()),
-                pairing: saved.map(|host| host.pairing.clone()),
-            });
-            self.nearby.add(&format!(
-                "{}{}",
-                device.name,
-                if saved.is_some() { "  —  Paired" } else { "" }
-            ));
             if self.active_target_id.as_ref() == Some(&device.id)
                 && let Some(network) = &self.network
             {
+                let saved = trusted.as_ref().filter(|host| host.id == device.id);
+                let addresses = ordered_addresses(
+                    saved.map(|host| host.address),
+                    device.addresses.iter().copied(),
+                );
                 let _ = network
                     .commands
                     .try_send(Command::UpdateAddresses(addresses));
             }
         }
-        if let Some(host) = trusted
-            && !self.discovered.iter().any(|device| device.id == host.id)
-        {
-            self.nearby
-                .add(&format!("{}  —  Paired (last address)", host.name));
-            self.targets.push(ConnectTarget {
-                addresses: vec![host.address],
-                id: Some(host.id),
-                name: Some(host.name),
-                pairing: Some(host.pairing),
-            });
+        self.refresh_nearby_list();
+        if self.network.is_none() && !self.targets.is_empty() {
+            self.network_status = "Found just now".into();
         }
-        if self.targets.is_empty() {
-            self.nearby.deactivate();
-        } else {
-            self.nearby.activate();
-            self.nearby.select(1);
-            if self.network.is_none() {
-                self.network_status = format!(
-                    "Found {}",
-                    self.targets[0].name.as_deref().unwrap_or("host")
-                );
-            }
+        for probe in probes {
+            self.queue_probe(probe);
         }
         true
     }
@@ -1173,12 +1326,92 @@ impl Ui {
                 self.show(Screen::Landing);
             }
             Action::ConnectNearby => {
-                let target = self
+                if self.network.is_some() {
+                    return Ok(false);
+                }
+                let id = self
                     .targets
                     .get((self.nearby.value() - 1).max(0) as usize)
-                    .cloned()
+                    .and_then(|target| target.id.clone())
                     .ok_or("No nearby computer is selected.")?;
-                self.connect_target(target)?;
+                match self.connection_flow.device(&id).map(|device| device.state) {
+                    Some(DeviceConnectionState::ReadyToPair)
+                    | Some(DeviceConnectionState::ReadyToConnect) => {
+                        self.prompt_for_device(&id)?;
+                    }
+                    Some(DeviceConnectionState::FoundButUnreachable)
+                    | Some(DeviceConnectionState::Offline) => {
+                        if let Some(probe) = self.connection_flow.retry(&id) {
+                            self.network_status = "Checking connection…".into();
+                            self.queue_probe(probe);
+                        }
+                    }
+                    Some(DeviceConnectionState::FoundJustNow)
+                    | Some(DeviceConnectionState::CheckingReachability) => {
+                        self.network_status = "Checking connection…".into();
+                    }
+                    _ => {}
+                }
+                self.refresh_nearby_list();
+            }
+            Action::BeginProbe(request) => {
+                if self.connection_flow.begin_probe(&request) {
+                    self.network_status = "Checking connection…".into();
+                    self.refresh_nearby_list();
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        let reachable = probe_addresses(&request.addresses);
+                        let _ = tx.send(Action::ProbeComplete {
+                            id: request.id,
+                            generation: request.generation,
+                            reachable,
+                        });
+                        app::awake();
+                    });
+                }
+            }
+            Action::ProbeComplete {
+                id,
+                generation,
+                reachable,
+            } => {
+                if self
+                    .connection_flow
+                    .finish_probe(&id, generation, reachable)
+                {
+                    self.network_status = if reachable {
+                        self.connection_flow
+                            .device(&id)
+                            .map(|device| device.state.label())
+                            .unwrap_or("Found just now")
+                            .into()
+                    } else {
+                        "Found but unreachable".into()
+                    };
+                    self.refresh_nearby_list();
+                    if reachable && self.connection_flow.should_prompt(&id) {
+                        self.prompt_for_device(&id)?;
+                    }
+                }
+            }
+            Action::CancelAttempt => {
+                if self.screen == Screen::Connect {
+                    if let Some(network) = &self.network {
+                        network.stop();
+                    }
+                    self.network = None;
+                    let cancelled = self.active_target_id.take().or_else(|| {
+                        self.targets
+                            .get((self.nearby.value() - 1).max(0) as usize)
+                            .and_then(|target| target.id.clone())
+                    });
+                    if let Some(id) = cancelled {
+                        self.connection_flow.not_now(&id);
+                    }
+                    self.model.connection(false, false);
+                    self.network_status = "Searching nearby".into();
+                    self.refresh_nearby_list();
+                }
             }
             Action::ConnectManual => {
                 let ip: IpAddr = self
@@ -1335,17 +1568,58 @@ impl Ui {
                 Screen::Connect
             });
         }
-        self.network_status = view.status;
+        let failure = view
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.summary.clone());
+        self.network_status = if self.pairing.is_some() {
+            "Waiting for phrase confirmation".into()
+        } else if view.status.contains("Retrying") {
+            "Retrying…".into()
+        } else if let Some(diagnostic) = &view.diagnostic {
+            diagnostic.summary.clone()
+        } else {
+            match view.progress.as_ref() {
+                Some(ConnectionProgress::SearchingNearby) => "Searching nearby".into(),
+                Some(ConnectionProgress::FoundDevice(name)) => format!("Found {name}"),
+                Some(ConnectionProgress::TryingLocalNetwork)
+                | Some(ConnectionProgress::TryingDirectEthernet) => "Checking connection…".into(),
+                Some(ConnectionProgress::EstablishingSecureConnection)
+                | Some(ConnectionProgress::Authenticating) => {
+                    "Establishing secure connection…".into()
+                }
+                Some(ConnectionProgress::ConnectedSecurely) => "Connected".into(),
+                None if view.running && !view.connected => "Retrying…".into(),
+                None => "Connection ended".into(),
+            }
+        };
         if self.model.drafts.len() > drafts {
             self.notice = "Unsent local text was kept in Drafts.".into();
         }
         if view.connected {
+            if let Some(id) = self.active_target_id.as_deref() {
+                let method = self.store.trusted_host().map_or("Local network", |host| {
+                    if matches!(host.address.ip(), IpAddr::V4(ip) if ip.is_link_local()) {
+                        "Direct Ethernet"
+                    } else {
+                        "Local network"
+                    }
+                });
+                self.connection_flow
+                    .mark_connected(id, Instant::now(), method);
+            }
             self.discovery = None;
             self.show(Screen::Workspace);
         } else if view.running && self.model.side == Side::Peer && self.discovery.is_none() {
             self.refresh_discovery();
         }
         if !view.running {
+            if let Some(id) = self.active_target_id.as_deref() {
+                self.connection_flow.mark_failure(
+                    id,
+                    failure.unwrap_or_else(|| "Connection attempt failed".into()),
+                );
+            }
             self.network = None;
             if self.screen == Screen::Connect {
                 self.refresh_discovery();
@@ -1361,21 +1635,28 @@ impl Ui {
                 .id
                 .as_ref()
                 .is_some_and(|id| Some(id) == self.active_target_id.as_ref());
-            let available = target
-                .id
-                .as_ref()
-                .is_some_and(|id| self.discovered.iter().any(|device| &device.id == id));
             let state = if active && self.pairing.as_ref().is_some_and(|p| p.repairing) {
-                "Needs repair"
+                "Pairing requires repair".into()
             } else if active && self.model.connected {
-                "Connected"
-            } else if available {
-                "Available"
+                "Connected".into()
+            } else if let Some(known) = target
+                .id
+                .as_deref()
+                .and_then(|id| self.connection_flow.device(id))
+            {
+                if known.state == DeviceConnectionState::Offline {
+                    format!(
+                        "Offline · last seen {}",
+                        Self::elapsed_label(known.last_seen)
+                    )
+                } else {
+                    known.state.label().into()
+                }
             } else {
-                "Offline"
+                "Offline · last seen unknown".into()
             };
             let line = index as i32 + 1;
-            let text = computer_row(target.name.as_deref().unwrap_or("Computer"), state);
+            let text = computer_row(target.name.as_deref().unwrap_or("Computer"), &state);
             if self.nearby.text(line).as_deref() != Some(&text) {
                 self.nearby.set_text(line, &text);
             }
@@ -1397,6 +1678,30 @@ impl Ui {
         }
         row_icons(&mut self.peers);
         row_icons(&mut self.nearby);
+        let selected = self
+            .targets
+            .get((self.nearby.value() - 1).max(0) as usize)
+            .and_then(|target| target.id.as_deref())
+            .and_then(|id| self.connection_flow.device(id));
+        let (label, enabled) = if self.network.is_some() {
+            ("Connecting…", false)
+        } else {
+            match selected.map(|device| device.state) {
+                Some(DeviceConnectionState::ReadyToPair) => ("Connect", true),
+                Some(DeviceConnectionState::ReadyToConnect) => ("Reconnect", true),
+                Some(DeviceConnectionState::FoundButUnreachable)
+                | Some(DeviceConnectionState::Offline) => ("Retry", true),
+                Some(DeviceConnectionState::FoundJustNow)
+                | Some(DeviceConnectionState::CheckingReachability) => ("Checking…", false),
+                _ => ("Connect", false),
+            }
+        };
+        self.connect_button.set_label(label);
+        if enabled {
+            self.connect_button.activate();
+        } else {
+            self.connect_button.deactivate();
+        }
         if self.screen != Screen::Workspace {
             self.update_dialog_layout();
         }
