@@ -105,7 +105,7 @@ jobs:
             <key>CFBundleName</key><string>Pair</string>
             <key>CFBundleIconFile</key><string>pair</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.4.2</string>
+            <key>CFBundleShortVersionString</key><string>0.5.0</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSLocalNetworkUsageDescription</key>
             <string>Pair finds and connects to another computer on your local network.</string>
@@ -141,4 +141,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "pair $GITHUB_REF_NAME" \
-            --notes "Pair v0.4.2 adds an explicit nearby connection flow. Pair now reports Found just now, Checking connection…, Ready to pair, Ready to connect, Found but unreachable, and Offline states; checks reachability before presenting a device confirmation prompt; suppresses duplicate prompts with Not now; and supports retry with refreshed discovered addresses. The retro Pair interface now presents Connect, Reconnect, Details, and keyboard-friendly cancellation during connection attempts. Pairing storage and Protocol v3 are unchanged. macOS artifacts are ad-hoc signed and not notarized; physical macOS validation is pending. The Jetson archive targets the Ubuntu 18.04 / JetPack 4 userspace generation."
+            --notes "Pair v0.5.0 adds command-line control under pair, authenticated single-instance handoff, stable-device aliases, opt-in automatic reconnect, centered connection dialogs, and per-user CLI installation. Use pair install-cli, then open a new terminal so the updated PATH is available. TLS 1.3, certificate phrase verification and pinning, Protocol v3, trusted-device storage, 20 ms synchronization, one active peer, and host-authoritative editing are unchanged. CI builds the Windows x64, Linux x64, Jetson ARM64/JetPack 4, macOS Intel, and macOS Apple Silicon packages. Physical Windows multi-monitor/DPI, macOS and Jetson pairing, and adapter-change reconnect checks remain outstanding. macOS artifacts are ad-hoc signed and not notarized."

@@ -53,6 +53,19 @@ If the host does not appear, open **Connection help...** for Refresh,
 connection help, and manual IP/port entry. The default port is `47321`. Pair
 tries available Wi-Fi, routed Ethernet, and direct-Ethernet addresses.
 
+## Command line control
+
+Install the per-user `pair` command from the Pair executable:
+
+```text
+pair install-cli
+```
+
+Open a new terminal afterward so the updated user `PATH` is available. Run
+`pair help` for commands including `pair nearby`, `pair connect <computer>`,
+`pair pair <computer>`, `pair host`, `pair status`, and device aliases. Pairing
+still requires comparing and confirming the certificate phrase in the GUI.
+
 ## Privacy and security
 
 Pair uses TLS 1.3. The first connection is visibly marked unverified and cannot
