@@ -9,7 +9,7 @@ use std::{
 use fltk::{
     app,
     browser::{BrowserScrollbar, HoldBrowser},
-    button::Button,
+    button::{Button, CheckButton},
     dialog, draw,
     enums::{Align, Color, ColorDepth, Damage, Event, Font, FrameType, Key, Shortcut},
     frame::Frame,
@@ -22,6 +22,7 @@ use fltk::{
     window::Window,
 };
 use pair::{
+    cli::{self, Control, Incoming, Preferences, Request, Response},
     discovery::{
         ConnectionFlow, DeviceConnectionState, DiscoveredDevice, DiscoveryBrowser, ProbeRequest,
         probe_addresses,
@@ -59,6 +60,15 @@ enum Screen {
 }
 
 enum Action {
+    AutoReconnect(bool),
+    CliResolved {
+        target: Result<ConnectTarget, String>,
+        reply: mpsc::Sender<Response>,
+    },
+    CliReply {
+        result: Result<String, String>,
+        reply: mpsc::Sender<Response>,
+    },
     OpenHost,
     OpenConnect,
     Back,
@@ -117,6 +127,10 @@ struct Ui {
     help_group: Group,
     manual_ip: Input,
     manual_port: Input,
+    auto_reconnect: CheckButton,
+    preferences: Preferences,
+    auto_suppressed: bool,
+    active_addresses: Vec<SocketAddr>,
     workspace_title: Frame,
     workspace_status: Frame,
     owner: Frame,
@@ -539,7 +553,7 @@ fn layout_screens(screens: &mut [Group; 4], w: i32, h: i32) {
         let help_open = screen.child(10).is_some_and(|c| c.visible());
         let pairing_open = screen.child(phrase).is_some_and(|c| c.visible());
         let extra = if help_open {
-            if is_host { 64 } else { 96 }
+            if is_host { 64 } else { 128 }
         } else {
             0
         } + if pairing_open { 104 } else { 0 };
@@ -563,7 +577,7 @@ fn layout_screens(screens: &mut [Group; 4], w: i32, h: i32) {
         }
         let mut list_bottom = status_y - GAP;
         if let Some(mut help) = screen.child(10).and_then(|c| c.as_group()) {
-            let help_h = if is_host { 56 } else { 88 };
+            let help_h = if is_host { 56 } else { 120 };
             let help_y = list_bottom - help_h;
             help.resize(x, help_y, width, help_h);
             help.set_frame(FrameType::EngravedBox);
@@ -577,6 +591,7 @@ fn layout_screens(screens: &mut [Group; 4], w: i32, h: i32) {
                 place(&help, 3, x + 16, help_y + 46, 100, ROW);
                 place(&help, 4, x + 124, help_y + 46, 120, ROW);
                 place(&help, 5, x + 258, help_y + 40, width - 274, 40);
+                place(&help, 6, x + 16, help_y + 82, width - 32, ROW);
             }
             if help_open {
                 list_bottom = help_y - GAP;
@@ -634,7 +649,251 @@ fn layout_screens(screens: &mut [Group; 4], w: i32, h: i32) {
 }
 
 impl Ui {
-    fn new(tx: mpsc::Sender<Action>, store: Store) -> Self {
+    fn centered_dialog(&self, message: &str, choices: &[&str]) -> Option<usize> {
+        let screen = app::screen_num(
+            self.window.x() + self.window.w() / 2,
+            self.window.y() + self.window.h() / 2,
+        );
+        let (sx, sy, sw, sh) = app::screen_work_area(screen);
+        let w = 520.min(sw - 32).max(240);
+        let lines = message
+            .lines()
+            .map(|line| (line.chars().count() / ((w - 40) / 8) as usize + 1) as i32)
+            .sum::<i32>();
+        let h = (lines * 22 + 100).clamp(170, 420.min(sh - 32).max(170));
+        let mut window = Window::new(sx + (sw - w) / 2, sy + (sh - h) / 2, w, h, "pair");
+        window.set_color(BG);
+        window.make_modal(true);
+        let mut text = Frame::new(20, 16, w - 40, h - 82, message);
+        text.set_align(Align::Inside | Align::Left | Align::Wrap);
+        text.set_label_size(14);
+        let done = Rc::new(Cell::new(false));
+        let result = Rc::new(Cell::new(None));
+        let button_w = (w - 32 - (choices.len() as i32 - 1) * 8) / choices.len() as i32;
+        for (index, label) in choices.iter().enumerate() {
+            let mut button = Button::new(
+                16 + index as i32 * (button_w + 8),
+                h - 52,
+                button_w,
+                34,
+                *label,
+            );
+            button_style(&mut button, index == 0);
+            let done = done.clone();
+            let result = result.clone();
+            button.set_callback(move |_| {
+                result.set(Some(index));
+                done.set(true);
+            });
+        }
+        window.end();
+        window.set_callback({
+            let done = done.clone();
+            move |_| done.set(true)
+        });
+        window.show();
+        while !done.get() && app::wait() {}
+        window.hide();
+        app::delete_widget(window);
+        result.get()
+    }
+
+    fn activate(&mut self) {
+        self.window.show();
+        let _ = self.window.take_focus();
+    }
+
+    fn cli_connect(&mut self, target: ConnectTarget) -> Result<String, String> {
+        self.activate();
+        let running = self
+            .network
+            .as_ref()
+            .is_some_and(|network| network.updates.borrow().running);
+        let hosting = running && self.model.side == Side::Host;
+        let same = !hosting
+            && running
+            && (target.id.is_some() && target.id == self.active_target_id
+                || target.id.is_none() && target.addresses == self.active_addresses);
+        if same {
+            return Ok("Pair is already using this computer. Window activated; run pair status for connection state.".into());
+        }
+        if cli::requires_switch(
+            running,
+            self.active_target_id.as_deref(),
+            target.id.as_deref(),
+            hosting,
+        ) {
+            if self.centered_dialog("End the current session and connect to this computer?\n\nYour local text and recovery drafts will be retained.", &["Switch computer", "Cancel"]) != Some(0) {
+                return Err("Connection cancelled. Current session retained.".into());
+            }
+        }
+        self.auto_suppressed = true;
+        self.show(Screen::Connect);
+        self.refresh_discovery();
+        self.connect_target(target)?;
+        Ok("Connection request accepted. Follow pairing or repair instructions in Pair; run pair status for progress.".into())
+    }
+
+    fn cli_request(&mut self, incoming: Incoming) {
+        let Incoming { request, reply } = incoming;
+        let result = match request {
+            Request::Open => {
+                self.activate();
+                if self.screen == Screen::Landing
+                    && self.preferences.auto_reconnect
+                    && !self.auto_suppressed
+                    && self.store.trusted_host().is_some()
+                {
+                    self.show(Screen::Connect);
+                    self.refresh_discovery();
+                }
+                Ok("Pair window activated.".into())
+            }
+            Request::Status => {
+                let view = self
+                    .network
+                    .as_ref()
+                    .map(|network| network.updates.borrow().clone());
+                let role = match view.as_ref() {
+                    Some(view) if view.running && self.model.side == Side::Host => "Host",
+                    Some(view) if view.running => "Connecting computer",
+                    _ => "Idle",
+                };
+                let state = if view
+                    .as_ref()
+                    .is_some_and(|view| view.connected && view.pairing.is_none())
+                {
+                    "Connected securely"
+                } else if view.as_ref().is_some_and(|view| view.pairing.is_some()) {
+                    "Waiting for phrase confirmation"
+                } else if role == "Host" {
+                    "Listening for a computer"
+                } else {
+                    &self.network_status
+                };
+                let diagnostic = view.as_ref().and_then(|view| view.diagnostic.as_ref());
+                let next = if self.pairing.is_some() {
+                    "Compare the certificate phrase on both computers and confirm in Pair."
+                } else if view.as_ref().is_some_and(|view| view.connected) {
+                    "The live notepad is ready."
+                } else if let Some(diagnostic) = diagnostic {
+                    &diagnostic.action
+                } else if role == "Host" {
+                    "Open Pair and connect from the other computer."
+                } else {
+                    "Open Pair for progress, or run pair nearby and pair connect <computer>."
+                };
+                Ok(format!("{role}: {state}\n{next}"))
+            }
+            Request::Connect(query) | Request::Pair(query) => {
+                let preferences = self.preferences.clone();
+                let store = self.store.clone();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let target = cli::resolve_target(&query, &preferences, &store);
+                    let _ = tx.send(Action::CliResolved { target, reply });
+                    app::awake();
+                });
+                return;
+            }
+            Request::Nearby => {
+                let saved = cli::saved_devices(&self.store);
+                let own_id = self.store.device().id;
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = cli::nearby().map(|mut devices| {
+                        devices.retain(|device| device.id != own_id);
+                        if devices.is_empty() { return "Device not discovered. Open Pair in host mode on the other computer.".into(); }
+                        devices.iter().map(|device| format!("{}  {}  {}  {}", device.name, device.id,
+                            if saved.iter().any(|saved| saved.id == device.id) { "paired" } else { "not paired" },
+                            device.addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n")
+                    });
+                    let _ = tx.send(Action::CliReply { result, reply });
+                    app::awake();
+                });
+                return;
+            }
+            Request::Host => {
+                self.activate();
+                let running = self
+                    .network
+                    .as_ref()
+                    .is_some_and(|network| network.updates.borrow().running);
+                if running && self.model.side == Side::Host {
+                    Ok("Pair is already hosting. Window activated.".into())
+                } else {
+                    let _ = reply.send(Response::from_result(Ok("Host request accepted. Check Pair for any session-switch confirmation; run pair status for progress.".into())));
+                    if running && self.centered_dialog("End the current connection and host a note?\n\nYour local text and recovery drafts will be retained.", &["Host note", "Cancel"]) != Some(0) {
+                        self.notice = "Hosting cancelled. Current session retained.".into();
+                    } else {
+                        self.auto_suppressed = true; self.show(Screen::Host); self.discovery = None; self.active_target_id = None;
+                        if let Err(error) = self.start_host() { self.notice = error; }
+                    }
+                    return;
+                }
+            }
+            Request::AliasList => {
+                let devices = cli::saved_devices(&self.store);
+                Ok(if self.preferences.aliases.is_empty() {
+                    "No aliases saved. Use pair alias set <computer> <alias>.".into()
+                } else {
+                    self.preferences
+                        .aliases
+                        .iter()
+                        .map(|(alias, id)| {
+                            format!(
+                                "{alias}  {id}  {}",
+                                devices
+                                    .iter()
+                                    .find(|device| &device.id == id)
+                                    .map_or("no longer paired", |device| &device.name)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            Request::AliasSet { computer, alias } => {
+                let devices = cli::saved_devices(&self.store);
+                cli::resolve_device(&computer, &self.preferences, &devices).and_then(|device| {
+                    let mut preferences = self.preferences.clone();
+                    preferences.set_alias(&alias, &device.id)?;
+                    preferences.save(
+                        self.store
+                            .path()
+                            .parent()
+                            .ok_or("Invalid configuration path.")?,
+                    )?;
+                    self.preferences = preferences;
+                    Ok(format!(
+                        "Alias '{}' saved for {}.",
+                        alias.to_ascii_lowercase(),
+                        device.name
+                    ))
+                })
+            }
+            Request::AliasRemove(alias) => {
+                let mut preferences = self.preferences.clone();
+                if preferences
+                    .aliases
+                    .remove(&alias.to_ascii_lowercase())
+                    .is_none()
+                {
+                    Err("Alias not found.".into())
+                } else {
+                    preferences
+                        .save(self.store.path().parent().unwrap())
+                        .map(|_| {
+                            self.preferences = preferences;
+                            "Alias removed.".into()
+                        })
+                }
+            }
+        };
+        let _ = reply.send(Response::from_result(result));
+    }
+
+    fn new(tx: mpsc::Sender<Action>, store: Store, preferences: Preferences) -> Self {
         let device = store.device();
         let mut window = Window::new(100, 100, 760, 500, "pair").center_screen();
         window.set_color(BG);
@@ -815,6 +1074,21 @@ impl Ui {
         );
         help.set_align(Align::Left | Align::Inside | Align::Wrap);
         help.set_label_size(11);
+        let mut auto_reconnect = CheckButton::new(
+            190,
+            575,
+            510,
+            30,
+            "Automatically reconnect to my last paired computer",
+        );
+        auto_reconnect.set_value(preferences.auto_reconnect);
+        auto_reconnect.set_label_size(12);
+        auto_reconnect.set_callback({
+            let tx = tx.clone();
+            move |button| {
+                let _ = tx.send(Action::AutoReconnect(button.value()));
+            }
+        });
         help_group.end();
         help_group.hide();
         let mut connect_back = Button::new(25, 585, 90, 38, "Back");
@@ -958,6 +1232,10 @@ impl Ui {
             help_group,
             manual_ip,
             manual_port,
+            auto_reconnect,
+            preferences,
+            auto_suppressed: false,
+            active_addresses: Vec::new(),
             workspace_title,
             workspace_status,
             owner,
@@ -1077,6 +1355,7 @@ impl Ui {
     }
     fn connect_target(&mut self, target: ConnectTarget) -> Result<(), String> {
         self.active_target_id = target.id.clone();
+        self.active_addresses = target.addresses.clone();
         self.start_network(
             Mode::Connect {
                 target,
@@ -1228,15 +1507,18 @@ impl Ui {
             )
         };
         loop {
-            match dialog::choice2_default(&message, primary, "Not now", "Details") {
+            match self.centered_dialog(&message, &[primary, "Not now", "Details"]) {
                 Some(0) => {
                     self.connection_flow.mark_connecting(id);
                     self.network_status = "Establishing secure connection…".into();
                     self.connect_target(target)?;
                     return Ok(());
                 }
-                Some(2) => dialog::message_default(&self.device_details(id)),
+                Some(2) => {
+                    self.centered_dialog(&self.device_details(id), &["OK"]);
+                }
                 _ => {
+                    self.auto_suppressed = true;
                     self.connection_flow.not_now(id);
                     return Ok(());
                 }
@@ -1307,6 +1589,36 @@ impl Ui {
 
     fn act(&mut self, action: Action) -> Result<bool, String> {
         match action {
+            Action::AutoReconnect(enabled) => {
+                let mut preferences = self.preferences.clone();
+                preferences.auto_reconnect = enabled;
+                if let Err(error) = preferences.save(
+                    self.store
+                        .path()
+                        .parent()
+                        .ok_or("Invalid configuration path.")?,
+                ) {
+                    self.auto_reconnect
+                        .set_value(self.preferences.auto_reconnect);
+                    return Err(error);
+                }
+                self.preferences = preferences;
+            }
+            Action::CliReply { result, reply } => {
+                let _ = reply.send(Response::from_result(result));
+            }
+            Action::CliResolved { target, reply } => match target {
+                Err(error) => {
+                    let _ = reply.send(Response::from_result(Err(error)));
+                }
+                Ok(target) => {
+                    let _ = reply.send(Response::from_result(Ok("Connection request accepted. Check Pair for any session-switch or pairing confirmation; run pair status for progress.".into())));
+                    match self.cli_connect(target) {
+                        Ok(message) => self.notice = message,
+                        Err(error) => self.notice = error,
+                    }
+                }
+            },
             Action::OpenHost => {
                 self.show(Screen::Host);
                 self.start_host()?;
@@ -1316,6 +1628,7 @@ impl Ui {
                 self.refresh_discovery();
             }
             Action::Back | Action::Disconnect => {
+                self.auto_suppressed = true;
                 if let Some(network) = &self.network {
                     network.stop();
                 }
@@ -1389,12 +1702,35 @@ impl Ui {
                         "Found but unreachable".into()
                     };
                     self.refresh_nearby_list();
-                    if reachable && self.connection_flow.should_prompt(&id) {
-                        self.prompt_for_device(&id)?;
+                    if reachable
+                        && self.network.is_none()
+                        && self.connection_flow.should_prompt(&id)
+                    {
+                        let saved = self.store.trusted_host();
+                        if cli::should_auto_reconnect(
+                            self.preferences.auto_reconnect,
+                            self.auto_suppressed,
+                            false,
+                            saved.as_ref().map(|host| host.id.as_str()),
+                            &id,
+                        ) {
+                            if let Some(target) = self
+                                .targets
+                                .iter()
+                                .find(|target| target.id.as_deref() == Some(&id))
+                                .cloned()
+                            {
+                                self.connection_flow.mark_connecting(&id);
+                                self.connect_target(target)?;
+                            }
+                        } else {
+                            self.prompt_for_device(&id)?;
+                        }
                     }
                 }
             }
             Action::CancelAttempt => {
+                self.auto_suppressed = true;
                 if self.screen == Screen::Connect {
                     if let Some(network) = &self.network {
                         network.stop();
@@ -1900,12 +2236,33 @@ impl Ui {
     }
 }
 
-pub fn run() {
+pub fn run(initial_auto: bool) {
     let application = app::App::default()
         .with_scheme(app::Scheme::Base)
         .load_system_fonts();
     choose_font();
     app::set_font_size(14);
+    let directory = match cli::directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            dialog::alert_default(&error);
+            return;
+        }
+    };
+    let control = match Control::claim(&directory, app::awake) {
+        Ok(control) => control,
+        Err(error) => {
+            // A simultaneous launch may have claimed the port before publishing its record.
+            for _ in 0..10 {
+                if cli::send(&directory, &Request::Open).is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            dialog::alert_default(&error);
+            return;
+        }
+    };
     let store = match Store::load_default() {
         Ok(store) => store,
         Err(error) => {
@@ -1914,11 +2271,27 @@ pub fn run() {
         }
     };
     let (tx, rx) = mpsc::channel();
-    let mut ui = Ui::new(tx, store);
+    let preferences = match Preferences::load(&directory) {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            dialog::alert_default(&error);
+            return;
+        }
+    };
+    let mut ui = Ui::new(tx, store, preferences);
     ui.render();
     ui.window.show();
+    if initial_auto && ui.preferences.auto_reconnect && ui.store.trusted_host().is_some() {
+        ui.show(Screen::Connect);
+        ui.refresh_discovery();
+        ui.render();
+    }
     while application.wait() {
         let mut changed = false;
+        while let Ok(incoming) = control.incoming.try_recv() {
+            ui.cli_request(incoming);
+            changed = true;
+        }
         while let Ok(action) = rx.try_recv() {
             changed = true;
             if !matches!(action, Action::Changed | Action::Flush | Action::Close) {

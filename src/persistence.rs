@@ -413,7 +413,7 @@ impl Store {
     }
 }
 
-fn default_path() -> Result<PathBuf, String> {
+pub fn default_path() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("PAIR_CONFIG_DIR") {
         return Ok(PathBuf::from(path).join("state.json"));
     }
@@ -458,11 +458,11 @@ fn set_dir_permissions(_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 #[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
