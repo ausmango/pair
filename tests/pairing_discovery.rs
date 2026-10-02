@@ -305,7 +305,7 @@ fn connection_flow_not_now_suppresses_duplicates_until_reappearance() {
     let id = "cd".repeat(16);
     let device = flow_device(&id, "Studio Mac");
     let mut flow = ConnectionFlow::default();
-    let probes = flow.observe(&[device.clone()], None, now);
+    let probes = flow.observe(std::slice::from_ref(&device), None, now);
     flow.begin_probe(&probes[0]);
     flow.finish_probe(&id, probes[0].generation, true);
     assert!(flow.should_prompt(&id));
@@ -316,8 +316,12 @@ fn connection_flow_not_now_suppresses_duplicates_until_reappearance() {
         DeviceConnectionState::Connecting
     );
     assert!(
-        flow.observe(&[device.clone()], None, now + Duration::from_secs(1))
-            .is_empty()
+        flow.observe(
+            std::slice::from_ref(&device),
+            None,
+            now + Duration::from_secs(1)
+        )
+        .is_empty()
     );
     assert!(!flow.should_prompt(&id));
     flow.observe(&[], None, now + Duration::from_secs(2));

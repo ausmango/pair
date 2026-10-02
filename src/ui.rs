@@ -485,7 +485,7 @@ fn place(group: &Group, index: i32, x: i32, y: i32, w: i32, h: i32) {
 fn footer(mut frame: Frame) {
     frame.super_draw(false);
     let mut pixels = include_bytes!("../assets/pear-icon.rgba").to_vec();
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel[3] = (u16::from(pixel[3]) * 55 / 100) as u8;
     }
     let mut pear = RgbImage::new(&pixels, 24, 24, ColorDepth::Rgba8)
@@ -722,10 +722,8 @@ impl Ui {
             self.active_target_id.as_deref(),
             target.id.as_deref(),
             hosting,
-        ) {
-            if self.centered_dialog("End the current session and connect to this computer?\n\nYour local text and recovery drafts will be retained.", &["Switch computer", "Cancel"]) != Some(0) {
-                return Err("Connection cancelled. Current session retained.".into());
-            }
+        ) && self.centered_dialog("End the current session and connect to this computer?\n\nYour local text and recovery drafts will be retained.", &["Switch computer", "Cancel"]) != Some(0) {
+            return Err("Connection cancelled. Current session retained.".into());
         }
         self.auto_suppressed = true;
         self.show(Screen::Connect);
